@@ -1,0 +1,26 @@
+[project]
+name = "tessera"
+version = "0.1.0"
+description = "Content-adaptive quadtree image tokenizer (fixed codes + FLUX.2 16 px latent leaves), judged by a perceptual gate; layout by search, or by a router once trained."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["torch", "torchvision", "numpy", "pillow", "click"]
+
+[project.optional-dependencies]
+# the encoder's judge (LPIPS-VGG, DISTS) and the FLUX.2 VAE (reference and flux leaves); the `.tsr` tools
+# overlay/info and the layout/token-file code need none of these
+encoder = ["lpips", "DISTS-pytorch", "diffusers==0.42.1", "transformers>=5.2", "accelerate", "safetensors"]
+dev = ["pytest"]
+
+[project.scripts]
+tessera = "tessera.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tessera"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
