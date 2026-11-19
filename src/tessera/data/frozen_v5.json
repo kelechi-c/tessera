@@ -1,0 +1,48 @@
+{
+ "frozen": {
+  "grain_thr": 0.1,
+  "T": 1.7759080042869313,
+  "keys": [
+   "lpips_max16",
+   "lpips_max64",
+   "lpips_max256",
+   "lpips_mean256",
+   "fine_max16",
+   "fine_max64",
+   "fine_max256",
+   "fine_mean256",
+   "color_max16",
+   "color_max64",
+   "color_max256",
+   "color_mean256",
+   "dists_tex_max16",
+   "dists_tex_max64",
+   "dists_tex_max256",
+   "dists_tex_mean256",
+   "seam_max16",
+   "seam_max64"
+  ],
+  "scale": {
+   "lpips_max16": 0.2989960253238678,
+   "lpips_max64": 0.19531896710395819,
+   "lpips_max256": 0.06686948984861374,
+   "lpips_mean256": 0.04377854987978935,
+   "fine_max16": 0.4405680298805237,
+   "fine_max64": 0.22243275046348585,
+   "fine_max256": 0.07894404232501984,
+   "fine_mean256": 0.051417519897222555,
+   "color_max16": 1.8886591434478763,
+   "color_max64": 0.8509073376655579,
+   "color_max256": 0.19762003719806678,
+   "color_mean256": 0.054598886519670486,
+   "dists_tex_max16": 0.13786464929580688,
+   "dists_tex_max64": 0.1279227435588837,
+   "dists_tex_max256": 0.06619552820920944,
+   "dists_tex_mean256": 0.04024320170283318,
+   "seam_max16": 35.39009552001954,
+   "seam_max64": 35.39009552001954
+  },
+  "n_positives": 77,
+  "sec": 15.3
+ }
+}
