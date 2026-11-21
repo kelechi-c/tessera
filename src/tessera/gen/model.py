@@ -139,12 +139,20 @@ class PackedRoPETransformer(nn.Module):
     Concatenates `[cls_b, real_tokens_b...]` across all batch items into ONE unpadded tensor `[1, L_tot, d]` so
     mixing 17-token and 1,024-token images wastes ZERO padding tokens."""
 
-    def __init__(self, d, depth, heads, use_flex="auto"):
+    def __init__(self, d, depth, heads, use_flex="auto", loops=1):
         super().__init__()
         self.d, self.depth, self.heads = int(d), int(depth), int(heads)
+        self.loops = int(loops)
+        if self.loops < 1:
+            raise ValueError(f"loops must be >= 1, got {loops}")
         self.head_dim = self.d // self.heads
         self.use_flex = use_flex
         self.blocks = nn.ModuleList(_RoPEBlock(self.d, self.heads) for _ in range(self.depth))
+        if self.loops > 1:
+            self.loop_emb = nn.Embedding(self.loops, self.d)
+            nn.init.zeros_(self.loop_emb.weight)
+            self.loop_norm = nn.LayerNorm(self.d)
+            self.loop_x0 = nn.Parameter(torch.full((self.loops,), 0.25))
 
     def forward_packed(self, cls_tok, tok_emb, pos, valid_mask, causal=False, level=None):
         """Pack `[B, T, d]` (with `valid_mask` [B, T] bool) + `cls_tok` [B, d] -> unpacked `[B, T, d]`.
@@ -224,8 +232,18 @@ class PackedRoPETransformer(nn.Module):
                 allow = same_doc
             sdpa_mask = allow[None, None]                                                # [1, 1, L, L] bool
 
-        for blk in self.blocks:
-            x = blk(x, cos, sin, block_mask=block_mask, sdpa_mask=sdpa_mask, flex_fn=flex_fn)
+        if self.loops == 1:
+            for blk in self.blocks:
+                x = blk(x, cos, sin, block_mask=block_mask, sdpa_mask=sdpa_mask, flex_fn=flex_fn)
+        else:
+            x0 = x
+            for lp in range(self.loops):
+                if lp == 0:
+                    x = x + self.loop_emb.weight[lp]
+                else:
+                    x = self.loop_norm(x) + self.loop_x0[lp] * x0 + self.loop_emb.weight[lp]
+                for blk in self.blocks:
+                    x = blk(x, cos, sin, block_mask=block_mask, sdpa_mask=sdpa_mask, flex_fn=flex_fn)
 
         out = torch.zeros(b, t, d, device=dev, dtype=x.dtype)
         if b_idx:
@@ -237,13 +255,13 @@ class PackedRoPETransformer(nn.Module):
 class TreeAR(nn.Module):
     START = 2
 
-    def __init__(self, n_classes, d=64, depth=2, heads=4, **_):
+    def __init__(self, n_classes, d=64, depth=2, heads=4, loops=1, **_):
         super().__init__()
         self.n_classes = n_classes
         self.cls = nn.Embedding(n_classes + 1, d)          # last index = unconditional
         self.pos = PosEmb(d)
         self.bit = nn.Embedding(3, d)                      # 0, 1, START
-        self.tf = PackedRoPETransformer(d, depth, heads)
+        self.tf = PackedRoPETransformer(d, depth, heads, loops=loops)
         self.norm = nn.LayerNorm(d)
         self.out = nn.Linear(d, 1)
 
@@ -387,14 +405,14 @@ def reveal_order(leaf_pos, order="size", generator=None):
 
 
 class TokenMAR(nn.Module):
-    def __init__(self, n_classes, d=64, depth=2, heads=4, head_w=64, head_depth=2):
+    def __init__(self, n_classes, d=64, depth=2, heads=4, head_w=64, head_depth=2, loops=1):
         super().__init__()
         self.n_classes = n_classes
         self.cls = nn.Embedding(n_classes + 1, d)
         self.pos = PosEmb(d)
         self.inp = nn.Linear(LY.TOK, d)
         self.mask_emb = nn.Parameter(torch.randn(d) * 0.02)
-        self.tf = PackedRoPETransformer(d, depth, heads)
+        self.tf = PackedRoPETransformer(d, depth, heads, loops=loops)
         self.norm = nn.LayerNorm(d)
         self.head = DiffHead(d, head_w, head_depth)
 
@@ -526,6 +544,7 @@ class BreadthGen(nn.Module):
         cfg = dict(CONFIGS[config] if isinstance(config, str) else config)
         cfg.pop("tree", None)
         d, depth, heads = cfg["d"], cfg["depth"], cfg["heads"]
+        loops = int(cfg.get("loops", 1))
         head_w, head_depth = cfg["head_w"], cfg["head_depth"]
         self.n_classes, self.config = n_classes, config
         self.heads = heads
@@ -533,7 +552,7 @@ class BreadthGen(nn.Module):
         self.pos = PosEmb(d)
         self.inp = nn.Linear(LY.TOK, d)
         self.mask_emb = nn.Parameter(torch.randn(d) * 0.02)
-        self.tf = PackedRoPETransformer(d, depth, heads)
+        self.tf = PackedRoPETransformer(d, depth, heads, loops=loops)
         self.norm = nn.LayerNorm(d)
         self.head = DiffHead(d, head_w, head_depth)
         self.split_head = nn.Linear(d, 1)
