@@ -10,6 +10,7 @@ from tessera.gen import rect_model as RM
 from tessera.latent import layout as LY
 from tessera.latent import rect as RL
 from tessera.latent import rect_router as RR
+from tessera.latent import rect_tiledown as RTD
 
 
 def _sample_kdtree_map(b=3, seed=0):
@@ -148,3 +149,61 @@ def test_rect_router_and_verify():
     res = RR.verify_rect(sm_coarse[:1], check_fn)
     assert res["passed"] and not res["fallback"] and RL.validate_rect(res["shape_map"])
     assert res["tokens"] == 5                                                 # 1 of 4 roots split in half -> 5 tiles
+
+
+def test_rect_tiledown_locality_and_zero_init():
+    torch.manual_seed(4)
+    z = torch.randn(2, 32, 64, 64)
+    basis = RL.fit_rect_basis(z)
+    td = RTD.RectTileDown(c=32, hid=64)
+
+    pyr_lin = RL.encode_rect_pyramid(z, basis)
+    pyr_td0 = RTD.encode_rect_pyramid_td(z, basis, tiledown=td)
+    for sh_sw in RL.SHAPES:
+        assert (pyr_td0[sh_sw] - pyr_lin[sh_sw]).abs().max().item() < 1e-6
+
+    # Randomize zero-initialized output head and verify strict tile locality on an (8, 16) tile
+    with torch.no_grad():
+        td.out.weight.normal_(0.0, 0.05)
+        td.out.bias.normal_(0.0, 0.05)
+    td.eval()
+    tok_a = td.encode_shape(z, (8, 16), basis)
+    z_pert = z.clone()
+    # Keep tile [gy=1, gx=2] -> rows [8:16], cols [32:48] unchanged; corrupt everything outside it
+    keep = z_pert[:, :, 8:16, 32:48].clone()
+    z_pert = z_pert + 5.0
+    z_pert[:, :, 8:16, 32:48] = keep
+    tok_b = td.encode_shape(z_pert, (8, 16), basis)
+    assert (tok_a[:, 1, 2] - tok_b[:, 1, 2]).abs().max().item() < 1e-6
+    assert (tok_a[:, 0, 0] - tok_b[:, 0, 0]).abs().max().item() > 1e-3
+
+
+def test_build_active_rect_canvas_matches_dense_and_grads():
+    torch.manual_seed(5)
+    z = torch.randn(2, 32, 64, 64)
+    basis = RL.fit_rect_basis(z)
+    basis_dev = RTD.basis_to_device(basis, z.device, dtype=z.dtype)
+    sm = _sample_kdtree_map(2, seed=19)
+    td = RTD.RectTileDown(c=32, hid=64)
+    with torch.no_grad():
+        td.out.weight.normal_(0.0, 0.05)
+        td.out.bias.normal_(0.0, 0.05)
+
+    for bopen in (False, True):
+        pyr_dense = RTD.encode_rect_pyramid_td(z, basis, tiledown=td)
+        dense_out = RL.build_rect_canvas(pyr_dense, sm, basis, border_open=bopen)
+        act_out = RTD.build_active_rect_canvas(z, sm, basis_dev, tiledown=td, border_open=bopen)
+        for ta, tb in zip(act_out, dense_out):
+            if ta.dtype == torch.bool:
+                assert torch.equal(ta, tb)
+            else:
+                assert (ta - tb).abs().max().item() < 1e-5
+
+    td.zero_grad()
+    canvas, mask, _, _, ac_gate = RTD.build_active_rect_canvas(z, sm, basis_dev, tiledown=td)
+    loss = ((canvas * mask) ** 2).mean() + (ac_gate * mask).mean()
+    loss.backward()
+    assert td.out.weight.grad is not None and torch.isfinite(td.out.weight.grad).all()
+    assert float(td.out.weight.grad.abs().sum()) > 0.0
+    assert td.conv1.weight.grad is not None and torch.isfinite(td.conv1.weight.grad).all()
+    assert float(td.conv1.weight.grad.abs().sum()) > 0.0
