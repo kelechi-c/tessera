@@ -1,0 +1,119 @@
+"""CPU unit tests for 2:1 k-d tree rectangular layouts, orthonormal DC+plane+AC basis, BreadthGenRect, and loops."""
+import pathlib
+import tempfile
+
+import torch
+
+from tessera.gen import data as GD
+from tessera.gen import model as GM
+from tessera.gen import rect_model as RM
+from tessera.latent import layout as LY
+from tessera.latent import rect as RL
+
+
+def _sample_kdtree_map(b=3, seed=0):
+    gen = torch.Generator().manual_seed(seed)
+    out = torch.zeros((b, 2, RL.SIDE, RL.SIDE), dtype=torch.long)
+    for bi in range(b):
+        frontier = [(0, 0, 32, 32), (0, 32, 32, 32), (32, 0, 32, 32), (32, 32, 32, 32)]
+        while frontier:
+            nxt = []
+            for r0, c0, sh, sw in frontier:
+                acts = RL.valid_actions(sh, sw)
+                if len(acts) == 1 or float(torch.rand(1, generator=gen)) > 0.65:
+                    out[bi, 0, r0:r0 + sh, c0:c0 + sw] = sh
+                    out[bi, 1, r0:r0 + sh, c0:c0 + sw] = sw
+                else:
+                    sa = [a for a in acts if a != RL.ACT_LEAF]
+                    a = sa[int(torch.randint(len(sa), (1,), generator=gen))]
+                    if a == RL.ACT_SPLIT_H:
+                        nxt += [(r0, c0, sh // 2, sw), (r0 + sh // 2, c0, sh // 2, sw)]
+                    else:
+                        nxt += [(r0, c0, sh, sw // 2), (r0, c0 + sw // 2, sh, sw // 2)]
+            frontier = nxt
+    return out
+
+
+def test_rect_layout_and_kdtree_trace():
+    sm = _sample_kdtree_map(4, seed=7)
+    assert RL.validate_rect(sm)
+    for bi in range(4):
+        leaves = RL.leaves_rect(sm[bi])
+        assert len(leaves) == int(RL.tokens_of_rect(sm[bi])[0])
+        nodes = RL.kdtree_trace(sm[bi])
+        trace_leaves = [(r, c, sh, sw) for r, c, sh, sw, _, a in nodes if a == RL.ACT_LEAF]
+        assert len(trace_leaves) == len(leaves)
+        # Every visited node must obey valid 2:1 actions
+        for _, _, sh, sw, lv, a in nodes:
+            assert a in RL.valid_actions(sh, sw)
+            assert lv == RL.level_of(sh, sw)
+
+
+def test_rect_basis_plane_exactness_and_ac_gate():
+    torch.manual_seed(0)
+    z = torch.randn(4, 32, 64, 64)
+    basis = RL.fit_rect_basis(z)
+    assert set(basis.keys()) == set(RL.COARSE_SHAPES)
+
+    # Pure linear gradient image in latent space (models smooth sky + flat Mondrian boxes)
+    yy = torch.linspace(-1.0, 1.0, 64)[None, None, :, None].expand(1, 32, 64, 64)
+    xx = torch.linspace(-1.0, 1.0, 64)[None, None, None, :].expand(1, 32, 64, 64)
+    plane_img = 1.5 + 0.7 * yy - 0.4 * xx
+    pyr = RL.encode_rect_pyramid(plane_img, basis)
+
+    for (sh, sw), entry in basis.items():
+        rec = RL.lift_rect_tokens(pyr[(sh, sw)], sh, sw, entry)
+        if entry["mode"] == "plane_pca32":
+            assert (rec - plane_img).abs().max().item() < 1e-4
+        # Plane-subtracted AC gate must be exact 0 on pure planes for ALL 12 coarse shapes!
+        g = RL.tile_ac_gate_rect(pyr[(sh, sw)], sh, sw, entry)
+        assert g.max().item() < 1e-4, f"non-zero gate on pure plane for {sh}x{sw}: {g.max().item()}"
+
+    sm = _sample_kdtree_map(1, seed=3)
+    canvas, mask, sf, pos, ac_gate = RL.build_rect_canvas(pyr, sm, basis)
+    assert canvas.shape == (1, 32, 64, 64)
+    assert mask.shape == (1, 1, 64, 64)
+    assert sf.shape == (1, 4, 64, 64)
+    assert pos.shape == (1, 2, 64, 64)
+    assert ac_gate.shape == (1, 1, 64, 64)
+    bx, by, b1 = RL.tile_border_masks(sm)
+    assert bx.shape == (1, 1, 64, 63) and by.shape == (1, 1, 63, 64) and b1.shape == (1, 1, 64, 64)
+
+
+def test_breadth_gen_rect_and_leaf_bias():
+    torch.manual_seed(1)
+    z = torch.randn(2, 32, 64, 64)
+    basis = RL.fit_rect_basis(z)
+    pyrs = [RL.encode_rect_pyramid(z[i:i + 1], basis) for i in range(2)]
+    sm = _sample_kdtree_map(2, seed=5)
+    stats = RM.ShapeStats().fit(pyrs)
+    ex = [RM.make_rect_breadth_example(pyrs[i], sm[i], label=i, stats=stats) for i in range(2)]
+    batch = RM.collate_rect_breadth(ex)
+
+    bg = RM.BreadthGenRect(2, d=64, depth=2, heads=4, loops=2, head_w=64, head_depth=2, stats=stats)
+    o = bg.loss(batch)
+    assert torch.isfinite(o["total"])
+    o["total"].backward()
+
+    sm0, _ = bg.sample(0, mar_steps=2, diff_steps=4, leaf_bias=0.0, generator=torch.Generator().manual_seed(0))
+    sm_hi, _ = bg.sample(0, mar_steps=2, diff_steps=4, leaf_bias=10.0, generator=torch.Generator().manual_seed(0))
+    assert RL.validate_rect(sm0) and RL.validate_rect(sm_hi)
+    # Huge positive leaf_bias must stop at the 4 root tiles (256x256 px)
+    assert int(RL.tokens_of_rect(sm_hi)[0]) == 4
+
+
+def test_looped_square_generators_roundtrip():
+    torch.manual_seed(2)
+    cfg = dict(d=64, depth=2, heads=4, loops=2, head_w=64, head_depth=2, tree=dict(d=32, depth=1, heads=4, loops=2))
+    gm = GM.TesseraGen(2, cfg)
+    bg = GM.BreadthGen(2, cfg)
+    sm = LY.all_grid(1)[0]
+    pyr = {2: torch.randn(32, 64, 64), 4: torch.randn(32, 32, 32), 8: torch.randn(32, 16, 16),
+           16: torch.randn(32, 8, 8), 32: torch.randn(32, 4, 4)}
+    gm.loss(GD.collate([GD.make_example(pyr, sm, 0)]))["total"].backward()
+    bg.loss(GD.collate_breadth([GD.make_breadth_example(pyr, sm, 0)]))["total"].backward()
+    with tempfile.TemporaryDirectory() as d:
+        p = pathlib.Path(d) / "gen.pt"
+        gm.save(p)
+        gm2 = GM.TesseraGen.load(p)
+        assert gm2.tokens.tf.loops == 2 and gm2.tree.tf.loops == 2

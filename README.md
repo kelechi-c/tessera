@@ -50,11 +50,13 @@ CPU-tested definitions, no weights:
   last round to 16 px, else the all-grid layout), checkpoints tagged with feature spec and TileUp id, and
   `LayoutRecord2` labels (`tessera/layout-record/2`).  `tessera.router` / `core/route.py` remain the fixed-code router
   of the shipped encoder.
-- `tessera.gen`: a MAR-style generator: `TreeAR` (split bits, always a valid tree) + `TokenMAR` (masked
-  autoregression over leaves with a diffusion head, largest tiles revealed first), per-level token normalisation, and
-  the grid baseline through the same code (`TesseraGen(..., fixed_layout=all_grid)`).  `CONFIGS["base"]` is a ~142M
-  transformer plus a ~35M diffusion head for both; the tree model is a separate ~3M.  The head predicts v (stable at high noise); labels are
-  dropped 10% of the time so the unconditional class is trained; checkpoints carry the per-level token statistics.
+- `tessera.gen`: MAR-style generators (`TesseraGen`, `BreadthGen`) with 2D axial center RoPE, packed varlen attention,
+  optional recurrent block looping (`loops >= 1` with `x0` input injection), Rectified Flow `DiffHead`, and per-level
+  token statistics.
+- `tessera.latent.rect` & `tessera.gen.rect_model`: 2:1 k-d tree rectangular pure-latent layouts (13 shapes, `16-256 px`,
+  aspect ratio <= 2:1), orthonormal DC+plane+AC linear lift bases (`dc_pca96` for small shapes, `plane_pca32` for coarse
+  shapes), plane-subtracted dead-zone AC gating, inter-tile border masks, and `BreadthGenRect` (4D log-shape MLP,
+  rectangular center RoPE, 3-way masked split head `{leaf, split-H, split-V}`, `loops=2`, and inference `leaf_bias`).
 
 Not written yet: the label, train and sampling commands (they go in `qtok/`, once the pyramid-latent shard format of
 plan S2 exists), classifier-free guidance in the sampler (the unconditional class is trained, not yet used), and the
