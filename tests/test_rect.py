@@ -207,3 +207,53 @@ def test_build_active_rect_canvas_matches_dense_and_grads():
     assert float(td.out.weight.grad.abs().sum()) > 0.0
     assert td.conv1.weight.grad is not None and torch.isfinite(td.conv1.weight.grad).all()
     assert float(td.conv1.weight.grad.abs().sum()) > 0.0
+
+
+def test_rect_router_integral_pooling_and_tiledown_feats():
+    torch.manual_seed(6)
+    z = torch.randn(2, 32, 64, 64)
+    basis = RL.fit_rect_basis(z)
+    td = RTD.RectTileDown(c=32, hid=64)
+    f_lin = RR.rect_router_features(z, basis)
+    f_td0 = RR.rect_router_features(z, basis, tiledown=td)
+    assert (f_td0 - f_lin).abs().max().item() < 1e-6
+
+    with torch.no_grad():
+        td.out.weight.normal_(0.0, 0.05)
+        td.out.bias.normal_(0.0, 0.05)
+    f_td1 = RR.rect_router_features(z, basis, tiledown=td)
+    assert (f_td1[:, 32:] - f_lin[:, 32:]).abs().max().item() > 1e-4
+
+    router = RR.LatentRouterRect(width=32, dilations=(1, 2))
+    h_1 = torch.randn(32, 64, 64, requires_grad=True)
+    nodes = [(0, 0, 32, 32), (0, 32, 16, 32), (32, 16, 16, 8), (60, 60, 4, 4)]
+    logits_vec = router.node_logits(h_1, nodes)
+
+    # Brute-force reference matching original slice-mean implementation
+    pooled_ref, s4_ref = [], []
+    for r0, c0, sh, sw in nodes:
+        pooled_ref.append(h_1[:, r0:r0 + sh, c0:c0 + sw].mean(dim=(1, 2)))
+        lsh, lsw = torch.log2(torch.tensor(sh / 2.0)), torch.log2(torch.tensor(sw / 2.0))
+        s4_ref.append((lsh, lsw, lsh + lsw, lsh - lsw))
+    logits_ref = router.head(torch.stack(pooled_ref, 0) + router.shape_mlp(torch.tensor(s4_ref, dtype=h_1.dtype)))
+    assert (logits_vec - logits_ref).abs().max().item() < 1e-5
+    logits_vec.sum().backward()
+    assert h_1.grad is not None and torch.isfinite(h_1.grad).all()
+    assert float(h_1.grad.abs().sum()) > 0.0
+
+
+def test_verify_rect_split_choice_fn():
+    sm_coarse = RL.all_grid_rect(1) * 0 + 32
+    calls = [0]
+
+    def check_fn(sm):
+        calls[0] += 1
+        if calls[0] == 1:
+            bad = torch.zeros((64, 64), dtype=torch.bool)
+            bad[:16, :16] = True
+            return dict(passed=False, bad8=bad, score=3.0)
+        return dict(passed=True, score=1.0)
+
+    res = RR.verify_rect(sm_coarse, check_fn, split_choice_fn=lambda r0, c0, sh, sw: RL.ACT_SPLIT_V)
+    assert res["passed"] and RL.validate_rect(res["shape_map"])
+    assert int(res["shape_map"][0, 0, 0, 0]) == 32 and int(res["shape_map"][0, 1, 0, 0]) == 16

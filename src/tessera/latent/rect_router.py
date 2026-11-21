@@ -7,7 +7,6 @@ residual features (zero VAE decode!) and predicts a valid 2:1 k-d tree `shape_ma
     `(r0, c0, sh, sw)` by average-pooling the feature map over `[r0:r0+sh, c0:c0+sw]` + 4D log-shape embedding.
   - At inference, decoding top-down from the 4 roots (32x32) guarantees a 100% valid 2:1 k-d tree in <5 ms!
 """
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,17 +14,22 @@ import torch.nn.functional as F
 from tessera.latent import rect as RL
 
 
-def rect_router_features(z512_n, basis):
-    """Cheap per-cell router features [B, 32 + 12, 64, 64]: z512_n + mean-abs linear-lift error for all 12 shapes."""
+def rect_router_features(z512_n, basis, tiledown=None):
+    """Cheap per-cell router features [B, 32 + 12, 64, 64]: z512_n + mean-abs lift error for all 12 shapes."""
     z = z512_n.float()
     errs = []
     for sh, sw in RL.COARSE_SHAPES:
         entry = basis[(sh, sw)]
-        tok = RL.project_rect_tokens(z, sh, sw, entry)
+        tok = RL.project_rect_tokens(z, sh, sw, entry) if tiledown is None else tiledown.encode_shape(z, (sh, sw), basis)
         zhat = RL.lift_rect_tokens(tok, sh, sw, entry)
         e = (zhat - z).abs().mean(dim=1, keepdim=True)                        # [B, 1, 64, 64]
         errs.append(e)
     return torch.cat([z] + errs, dim=1).to(z512_n.dtype)                      # [B, 44, 64, 64]
+
+
+def _integral_image(h_1):
+    """2D summed-area table in float32: `[W, H, W_sp] -> [W, H+1, W_sp+1]`."""
+    return F.pad(h_1.float(), (1, 0, 1, 0)).cumsum(dim=1).cumsum(dim=2)
 
 
 class _DilBlock(nn.Module):
@@ -59,16 +63,21 @@ class LatentRouterRect(nn.Module):
     def encode_grid(self, feat):
         return F.silu(self.norm(self.blocks(self.stem(feat))))                # [B, W, 64, 64]
 
-    def node_logits(self, h_1, nodes):
+    def node_logits(self, h_1, nodes, sat=None):
         """Single-image feature map `h_1` [W, 64, 64] + list of `(r0, c0, sh, sw)` -> logits [N, 3]."""
+        if not nodes:
+            return h_1.new_zeros((0, 3))
         dev = h_1.device
-        pooled, s4s = [], []
-        for r0, c0, sh, sw in nodes:
-            pooled.append(h_1[:, r0:r0 + sh, c0:c0 + sw].mean(dim=(1, 2)))
-            lsh, lsw = math.log2(sh / 2.0), math.log2(sw / 2.0)
-            s4s.append((lsh, lsw, lsh + lsw, lsh - lsw))
-        p = torch.stack(pooled, 0)                                            # [N, W]
-        s4 = torch.tensor(s4s, dtype=p.dtype, device=dev)                     # [N, 4]
+        if sat is None:
+            sat = _integral_image(h_1)
+        t = torch.tensor(nodes, dtype=torch.long, device=dev)                 # [N, 4]
+        r0, c0, sh, sw = t[:, 0], t[:, 1], t[:, 2], t[:, 3]
+        r1, c1 = r0 + sh, c0 + sw
+        box_sum = sat[:, r1, c1] - sat[:, r0, c1] - sat[:, r1, c0] + sat[:, r0, c0]
+        p = (box_sum / (sh * sw).to(box_sum.dtype).unsqueeze(0)).transpose(0, 1).to(h_1.dtype)
+        lsh = torch.log2(sh.to(p.dtype) / 2.0)
+        lsw = torch.log2(sw.to(p.dtype) / 2.0)
+        s4 = torch.stack((lsh, lsw, lsh + lsw, lsh - lsw), dim=1)             # [N, 4]
         return self.head(p + self.shape_mlp(s4))                              # [N, 3]
 
     def loss(self, feat, shape_maps):
@@ -83,7 +92,8 @@ class LatentRouterRect(nn.Module):
                 continue
             nodes = [(r0, c0, sh, sw) for r0, c0, sh, sw, _ in splittable]
             targets = torch.tensor([a for *_, a in splittable], dtype=torch.long, device=dev)
-            logits = self.node_logits(h[bi], nodes)
+            sat = _integral_image(h[bi])
+            logits = self.node_logits(h[bi], nodes, sat=sat)
             sh_t = torch.tensor([sh for _, _, sh, _ in nodes], dtype=torch.long, device=dev)
             sw_t = torch.tensor([sw for _, _, _, sw in nodes], dtype=torch.long, device=dev)
             logits = logits.masked_fill(~RL.valid_action_mask(sh_t, sw_t), -1e9)
@@ -98,9 +108,10 @@ class LatentRouterRect(nn.Module):
         b = h.shape[0]
         out = torch.zeros((b, 2, RL.SIDE, RL.SIDE), dtype=torch.long, device=h.device)
         for bi in range(b):
+            sat = _integral_image(h[bi])
             frontier = [(0, 0, 32, 32), (0, 32, 32, 32), (32, 0, 32, 32), (32, 32, 32, 32)]
             while frontier:
-                logits = self.node_logits(h[bi], frontier)
+                logits = self.node_logits(h[bi], frontier, sat=sat)
                 if leaf_bias != 0.0:
                     logits = logits.clone()
                     logits[:, RL.ACT_LEAF] += float(leaf_bias)
@@ -121,7 +132,7 @@ class LatentRouterRect(nn.Module):
         return out
 
 
-def verify_rect(shape_map, check_fn, max_rounds=8):
+def verify_rect(shape_map, check_fn, max_rounds=8, split_choice_fn=None):
     """Fast verify loop for a routed `shape_map` [1, 2, 64, 64]: split failing `bad8` tiles until `check_fn` passes."""
     dev = shape_map.device
     sm = shape_map.clone()
@@ -151,6 +162,10 @@ def verify_rect(shape_map, check_fn, max_rounds=8):
             else:
                 acts = [a for a in RL.valid_actions(sh, sw) if a != RL.ACT_LEAF]
                 a = acts[0]
+                if len(acts) > 1 and split_choice_fn is not None:
+                    cand = int(split_choice_fn(r0, c0, sh, sw))
+                    if cand in acts:
+                        a = cand
                 if a == RL.ACT_SPLIT_H:
                     nxt[0, 0, r0:r0 + sh, c0:c0 + sw] = sh // 2
                     nxt[0, 1, r0:r0 + sh, c0:c0 + sw] = sw
