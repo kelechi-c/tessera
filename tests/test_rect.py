@@ -9,6 +9,7 @@ from tessera.gen import model as GM
 from tessera.gen import rect_model as RM
 from tessera.latent import layout as LY
 from tessera.latent import rect as RL
+from tessera.latent import rect_router as RR
 
 
 def _sample_kdtree_map(b=3, seed=0):
@@ -117,3 +118,33 @@ def test_looped_square_generators_roundtrip():
         gm.save(p)
         gm2 = GM.TesseraGen.load(p)
         assert gm2.tokens.tf.loops == 2 and gm2.tree.tf.loops == 2
+
+
+def test_rect_router_and_verify():
+    torch.manual_seed(3)
+    z = torch.randn(2, 32, 64, 64)
+    basis = RL.fit_rect_basis(z)
+    feat = RR.rect_router_features(z, basis)
+    assert feat.shape == (2, RR.LatentRouterRect.IN_CH, 64, 64)
+    router = RR.LatentRouterRect(width=32, dilations=(1, 2))
+    sm_gt = _sample_kdtree_map(2, seed=11)
+    loss = router.loss(feat, sm_gt)
+    assert torch.isfinite(loss)
+    loss.backward()
+    sm_pred = router.route(feat)
+    assert RL.validate_rect(sm_pred)
+    sm_coarse = router.route(feat, leaf_bias=10.0)
+    assert int(RL.tokens_of_rect(sm_coarse)[0]) == 4
+
+    # Verify loop: fail once on top-left quadrant, then pass
+    calls = [0]
+    def check_fn(sm):
+        calls[0] += 1
+        if calls[0] == 1:
+            bad = torch.zeros((64, 64), dtype=torch.bool)
+            bad[:16, :16] = True
+            return dict(passed=False, bad8=bad, score=3.0)
+        return dict(passed=True, score=1.0)
+    res = RR.verify_rect(sm_coarse[:1], check_fn)
+    assert res["passed"] and not res["fallback"] and RL.validate_rect(res["shape_map"])
+    assert res["tokens"] == 5                                                 # 1 of 4 roots split in half -> 5 tiles
