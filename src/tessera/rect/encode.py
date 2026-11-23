@@ -2,7 +2,8 @@
 
 Per image: FLUX.2 encoder -> latent z; a layout (`shape_map`) is found so that the decoded tile canvas passes the
 Judge against the plain FLUX.2 round trip (`--mode topdown`: split Judge-failing leaves until it passes; `--mode
-rdtree`: one-shot rate-distortion tree, optionally verified by splitting).  `--prune_merges` then merges sibling
+router`: the learned router predicts the layout in one pass, then verification splits failing leaves; `--mode rdtree`:
+one-shot rate-distortion tree, same verification).  `--prune_merges` then merges sibling
 leaves while the Judge still passes.  Output: `results.json`, comparison strips (original | decode | tiles) and with
 `--save_layouts` the layouts themselves.
 
@@ -112,11 +113,13 @@ def _load_images(images_dir, limit, dev):
 @click.argument("out", type=click.Path())
 @click.option("--images", type=click.Path(exists=True, file_okay=False), required=True, help="folder of images (png/jpg/webp)")
 @click.option("--ckpt", type=click.Path(exists=True), required=True, help="tileup_rect.pt tokenizer checkpoint")
-@click.option("--mode", type=click.Choice(["topdown", "rdtree"]), default="topdown", show_default=True)
+@click.option("--mode", type=click.Choice(["topdown", "router", "rdtree"]), default="topdown", show_default=True)
+@click.option("--router", type=click.Path(exists=True), default=None, help="router_rect.pt (inference weights) for --mode router")
+@click.option("--leaf_bias", type=float, default=0.0, show_default=True, help="--mode router: added to the leaf logit (more leaves, fewer tokens)")
 @click.option("--verify/--no_verify", default=True, show_default=True,
-              help="--mode rdtree: split Judge-failing leaves of the one-shot tree until it passes")
+              help="--mode router/rdtree: split Judge-failing leaves of the one-shot layout until it passes")
 @click.option("--verify_rounds", type=int, default=8, show_default=True,
-              help="--mode rdtree --verify: max split rounds before the all-2x2 fallback")
+              help="--mode router/rdtree --verify: max split rounds before the all-2x2 fallback")
 @click.option("--rd_lambda", type=float, default=0.05, show_default=True, help="--mode rdtree: per-token cost lambda")
 @click.option("--rd_beta", type=float, default=0.5, show_default=True, help="--mode rdtree: weight of max(e) in node distortion")
 @click.option("--rd_area_pow", type=float, default=0.0, show_default=True, help="--mode rdtree: scale node D by (sh*sw/4)**p")
@@ -139,7 +142,7 @@ def _load_images(images_dir, limit, dev):
 @click.option("--strips", type=int, default=12, show_default=True, help="write comparison strips for the first N images")
 @click.option("--save_layouts", is_flag=True, default=False,
               help="also write OUT/layouts/<idx>_<id>.npz (shape_map uint8 [2,64,64], original, decode, FLUX.2 round trip)")
-def main(out, images, ckpt, mode, verify, verify_rounds, rd_lambda, rd_beta, rd_area_pow, rd_tau, judge_scale, struct_scale,
+def main(out, images, ckpt, mode, router, leaf_bias, verify, verify_rounds, rd_lambda, rd_beta, rd_area_pow, rd_tau, judge_scale, struct_scale,
          color_floor_de, color_max_floor_de, mae32_limit, tu_spike_k, tu_spike_min_area, prune_merges, prune_fast,
          prune_max_calls, prune_max_rounds, limit, strips, save_layouts):
     """Encode the images in --images to Judge-verified 2:1 k-d tree layouts; results go to OUT."""
@@ -153,7 +156,15 @@ def main(out, images, ckpt, mode, verify, verify_rounds, rd_lambda, rd_beta, rd_
     if strips > 0:
         strips_dir.mkdir(parents=True, exist_ok=True)
 
+    if mode == "router" and router is None:
+        raise click.ClickException("--mode router requires --router PATH")
     tu, td, basis_dev, mean, std, _ = load_tokenizer_ckpt(ckpt, dev)
+    router_mod = None
+    if mode == "router":
+        ck_r = torch.load(router, map_location="cpu", weights_only=True)
+        router_mod = RR.LatentRouterRect(width=int(ck_r["width"]), dilations=tuple(int(x) for x in ck_r["dilations"]),
+                                         maxpool_feats=bool(ck_r.get("maxpool_feats", False))).to(dev).eval()
+        router_mod.load_state_dict(ck_r["model"])
     mv, sv = mean.view(1, RL.CH, 1, 1).to(dev), std.view(1, RL.CH, 1, 1).to(dev)
     if tu_spike_k > 0:
         tu._spike_k, tu._spike_min_area = float(tu_spike_k), int(tu_spike_min_area)
@@ -205,7 +216,11 @@ def main(out, images, ckpt, mode, verify, verify_rounds, rd_lambda, rd_beta, rd_
                 rect_pyr_n = RTD.encode_rect_pyramid_td(zn, basis_dev, tiledown=td)
                 err_maps = compute_lift_err_maps(z1, rect_pyr_n, basis_dev, mv, sv, tilelift=getattr(tu, "_tilelift", None),
                                                  ac_floor=getattr(tu, "_ac_floor", 0.20), ac_tau=getattr(tu, "_ac_tau", 0.20))
-                sm0 = rd_layout(err_maps, rd_lambda, rd_beta, area_pow=rd_area_pow, tau=rd_tau).to(dev)[None]
+                if mode == "rdtree":
+                    sm0 = rd_layout(err_maps, rd_lambda, rd_beta, area_pow=rd_area_pow, tau=rd_tau).to(dev)[None]
+                else:
+                    sm0 = router_mod.route(RR.rect_router_features(zn, basis_dev, tiledown=td), leaf_bias=leaf_bias,
+                                           leaf_bias_slope=0.0)
                 last_y = [None]
                 n_check = [0]
                 route_tok = int(RL.tokens_of_rect(sm0)[0])
@@ -264,7 +279,7 @@ def main(out, images, ckpt, mode, verify, verify_rounds, rd_lambda, rd_beta, rd_
             print(f"  [{idx + 1}/{len(entries)}] {rid[:24]} tok={toks} pass={passed} calls={calls} {dt_ms:.0f}ms", flush=True)
 
     meta = dict(mode=mode, verify=verify, judge_scale=judge_scale, prune_merges=bool(prune_merges),
-                prune_fast=bool(prune_fast), prune_max_calls=int(prune_max_calls), prune_max_rounds=int(prune_max_rounds),
+                leaf_bias=leaf_bias, prune_fast=bool(prune_fast), prune_max_calls=int(prune_max_calls), prune_max_rounds=int(prune_max_rounds),
                 verify_rounds=int(verify_rounds), rd_lambda=rd_lambda, rd_beta=rd_beta, rd_area_pow=rd_area_pow, rd_tau=rd_tau,
                 **jx)
     if tu_spike_k > 0:
