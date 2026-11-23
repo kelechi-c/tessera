@@ -1,3 +1,2 @@
-"""tessera: quadtree image tokens (see README.md).  Heavy parts (judge, search, VAE) import lazily."""
-__version__ = "0.1.0"
-FORMAT = "tessera/1"
+"""tessera: 2:1 k-d tree tokens over FLUX.2 latents (see README.md)."""
+__version__ = "0.2.0"

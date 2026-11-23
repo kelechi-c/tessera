@@ -7,13 +7,10 @@ judge5_search, but an evaluation computes only the y-side terms and stays on the
     ops on the device with a fixed operation order; one `.cpu()` of the 18 gate values per evaluation (the bad map stays on
     the device unless it is needed);
   * the candidate is quantised to uint8 on the device (same clamp / round as the PNG writer), no PNG in the loop;
-  * `JudgeFast` caches the verdict by the uint8 decode, so an exact repeat costs one hash.
 LPIPS and DISTS both use a VGG16 trunk but with different input scaling and pooling (max vs L2) after the first stage, so
 the trunk is not shared.
 """
-import hashlib
 import math
-import time
 
 import numpy as np
 import torch
@@ -437,103 +434,3 @@ def evaluate(x_u8, g_u8, y_u8, frozen, dev=None, attribute=False):
     if attribute:
         r["bad8"] = r["bad8"].cpu().numpy()
     return r
-
-
-class JudgeFast(S.Judge5):
-    """Drop-in for hires.run_oracle / vae16.run_oracle_vae16.  Caches verdicts by the uint8 decode."""
-
-    def __init__(self, dev, frozen_json):
-        super().__init__(dev, frozen_json)
-        self.fc = None
-        self.cache = {}
-        self.pass_cache = {}
-        self.n_cached = 0
-
-    @torch.no_grad()
-    def cellmap(self, xh, x, fx):
-        key = (tuple(x.shape), round(float(x.sum()), 3), round(float(x[..., ::37, ::41].sum()), 3))
-        if key != self._key:
-            self._key = key
-            self.cache = {}
-            self.pass_cache = {}
-            ux, ug = S.quantise(x), S.quantise(xh)
-            self.v5 = None
-            self.fc = FastContext(ux, ug, self.fr.thr, self.dev).bind(self.fr)
-            self.last = None
-            return torch.zeros(1, G8, G8, device=xh.device)
-        t0 = time.time()
-        uy = quantise_t(xh)
-        h = hashlib.md5(uy.cpu().numpy().tobytes()).digest()
-        r = self.cache.get(h)
-        if r is None:
-            r = self.fc.evaluate_u8(uy)
-            self.cache[h] = r
-            self.pass_cache[h] = bool(r["passed"])
-        else:
-            self.n_cached += 1
-        self.sec += time.time() - t0
-        self.n_eval += 1
-        self.last = r
-        return torch.where(r["bad8"].to(xh.device), BIG, 0.0)[None]
-
-    @torch.no_grad()
-    def evaluate_batch(self, xhs):
-        """Evaluate a batch of candidate decodes [B, 3, H, W] (or list of [1, 3, H, W]).
-        Returns list of (score, passed, bad8_bool_on_dev) matching `cellmap` + `last`."""
-        if not len(xhs):
-            return []
-        t0 = time.time()
-        xhs_t = xhs if torch.is_tensor(xhs) and xhs.ndim == 4 else torch.cat(list(xhs), 0)
-        uys = quantise_batch_t(xhs_t.to(self.dev))
-        uys_np = uys.cpu().numpy()
-        hashes = [hashlib.md5(uys_np[i].tobytes()).digest() for i in range(len(uys_np))]
-        results = [self.cache.get(h) for h in hashes]
-        seen = {}
-        uniq_pos = []
-        for i, (h, r) in enumerate(zip(hashes, results)):
-            if r is None and h not in seen:
-                seen[h] = len(uniq_pos)
-                uniq_pos.append(i)
-        self.n_cached += len(results) - len(uniq_pos)
-        if uniq_pos:
-            miss_res = self.fc.evaluate_u8_batch(uys[uniq_pos], attribute=True)
-            for pos, res in zip(uniq_pos, miss_res):
-                h = hashes[pos]
-                self.cache[h] = res
-                self.pass_cache[h] = bool(res["passed"])
-            for i, h in enumerate(hashes):
-                if results[i] is None:
-                    results[i] = self.cache[h]
-        self.sec += time.time() - t0
-        self.n_eval += len(results)
-        self.last = results[-1]
-        return [(r["score"], r["passed"], r["bad8"]) for r in results]
-
-    @torch.no_grad()
-    def passes_batch(self, xhs):
-        """Fast pass/fail batch verdict with cascaded early-exit (skips LPIPS/DISTS on early failures)."""
-        if not len(xhs):
-            return []
-        t0 = time.time()
-        xhs_t = xhs if torch.is_tensor(xhs) and xhs.ndim == 4 else torch.cat(list(xhs), 0)
-        uys = quantise_batch_t(xhs_t.to(self.dev))
-        uys_np = uys.cpu().numpy()
-        hashes = [hashlib.md5(uys_np[i].tobytes()).digest() for i in range(len(uys_np))]
-        out = [self.pass_cache.get(h) for h in hashes]
-        seen = {}
-        uniq_pos = []
-        for i, (h, p) in enumerate(zip(hashes, out)):
-            if p is None and h not in seen:
-                seen[h] = len(uniq_pos)
-                uniq_pos.append(i)
-        self.n_cached += len(out) - len(uniq_pos)
-        if uniq_pos:
-            flags = self.fc.passes_u8_batch(uys[uniq_pos])
-            for pos, flag in zip(uniq_pos, flags):
-                self.pass_cache[hashes[pos]] = bool(flag)
-            for i, h in enumerate(hashes):
-                if out[i] is None:
-                    out[i] = self.pass_cache[h]
-        self.sec += time.time() - t0
-        self.n_eval += len(out)
-        return out

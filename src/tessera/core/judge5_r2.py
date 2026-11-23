@@ -1,6 +1,6 @@
 """Judge v5 gate maths (frozen scales are applied by the caller): the 18 gates and the block means.
 
-Trimmed copy of qtok/judge5_r2.py: only TERMS, KEYS, _block and gate_vector (the bank-evaluation code stays in qtok)."""
+Only TERMS, KEYS, _block and gate_vector (no bank-evaluation code)."""
 import numpy as np
 
 TERMS = ("lpips", "fine", "color", "dists_tex")

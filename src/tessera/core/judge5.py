@@ -42,7 +42,7 @@ from . import sharp
 
 WINDOWS = (16, 64, 256)
 DINO = "facebook/dinov3-vitb16-pretrain-lvd1689m"
-# grain rule constants (qtok/hires.py TAU, E_CLEAN, CREST; images in [-1, 1])
+# grain rule constants (TAU, E_CLEAN, CREST; images in [-1, 1])
 TAU, E_CLEAN, CREST = .045, .006, 4.5
 SIG_LAB = 4.0
 

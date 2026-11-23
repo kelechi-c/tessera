@@ -1,8 +1,7 @@
 """Sharpness floor (revision 5, T1 + T2p step 0): fine-detail energy per 16 px block.
 
-The measure is the reviewer's `docs/reviews/fable-results/t0/blur_blocks.py` as torch code.  `blur_blocks.py` builds
-its band-pass with PIL's `GaussianBlur(1.5)`, which is a three-pass box blur with the fractional radius Pillow derives
-from sigma 1.5 (`_gaussian_blur_radius`: r = 1.0384615...).  We reproduce exactly that filter so the reference count
+The measure is the reference blur-block counter as torch code.  The reference builds its band-pass with PIL's
+`GaussianBlur(1.5)`, which is a three-pass box blur with the fractional radius Pillow derives from sigma 1.5 (`_gaussian_blur_radius`: r = 1.0384615...).  We reproduce exactly that filter so the reference count
 (68 +/- 3 blurred blocks on the Waldo pair) holds; a true 9x9 Gaussian differs on the same pair (63 blocks) because
 the count is sensitive to the tail of the kernel.
 
@@ -18,14 +17,9 @@ The floor rejects nothing the FLUX.2 VAE round trip does (0 of about 14,000 deta
 the shipped decode blurs 153 and the adopted rule 294, in clusters.  T1 adds `blurred` to the judge as culprits; T2p
 trains `L_sharp` on `block_std` (differentiable path).
 
-usage (CPU check, the T.7 step 0 test):
-  python -m qtok.sharp check DIR   # e.g. docs/reviews/fable-results/s5
 """
 import math
-import pathlib
 
-import click
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -210,44 +204,3 @@ def summary(xh, x, **kw):
     win = window_ratio(xh, x, kw.get("block", BLOCK), kw.get("act", ACT), 64, kw.get("uint8", True))[0]
     return dict(blurred=int(b.sum()), detail=int(act_m.sum()), median=float(torch.nanmedian(win).nan_to_num(nan=1.)),
                 window_fail=int(((win < .9) & ~torch.isnan(win)).sum()))
-
-
-# ---------------------------------------------------------------- CPU check (T.7 step 0) ----------------------------------
-def _load(p):
-    from PIL import Image
-
-    a = np.asarray(Image.open(p).convert("RGB"), np.float32) / 255
-    return torch.from_numpy(a).permute(2, 0, 1)[None]
-
-
-def check_pair(orig, dec, uint8=True):
-    """(blurred count, detail blocks, median ratio) of a decode PNG against its original PNG."""
-    o, d = _load(orig), _load(dec)
-    ratio, act_m, _, _ = detail_ratio(d, o, uint8=uint8)
-    n = int((act_m & (ratio < FLOOR)).sum())
-    med = float(ratio[act_m].median()) if bool(act_m.any()) else 1.0
-    return n, int(act_m.sum()), med
-
-
-@click.group()
-def cli():
-    pass
-
-
-@cli.command()
-@click.argument("root", type=click.Path(exists=True, file_okay=False))
-def check(root):
-    """T.7 step 0: 68 +/- 3 blurred blocks on the shipped Waldo decode, 0 on its VAE decode."""
-    root = pathlib.Path(root)
-    pair = root / "decodes_sh" / "39_waldo_altdorfer_crucifixion_"
-    sh = check_pair(str(pair) + "orig.png", str(pair) + "shipped_e80.png")
-    va = check_pair(str(pair) + "orig.png", str(pair) + "vae.png")
-    print(f"shipped: blurred {sh[0]} / detail {sh[1]}, median ratio {sh[2]:.3f}")
-    print(f"vae:     blurred {va[0]} / detail {va[1]}, median ratio {va[2]:.3f}")
-    ok = abs(sh[0] - 68) <= 3 and va[0] == 0
-    print(f"CHECK {'PASS' if ok else 'FAIL'} (shipped {sh[0]} expected 68 +/- 3; vae {va[0]} expected 0)")
-    raise SystemExit(0 if ok else 1)
-
-
-if __name__ == "__main__":
-    cli()
