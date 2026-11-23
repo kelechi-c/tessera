@@ -8,7 +8,7 @@ Tessera encodes a 512 × 512 image as a variable number of rectangular latent to
 
 The frozen FLUX.2 encoder maps the input to a 64 × 64 grid of 32-channel latent cells. TileDown computes candidate tile representations. The learned router proposes a rectangular partition across four roots, choosing where to keep a leaf or split it horizontally or vertically. Each selected leaf contributes one token.
 
-TileLift and TileUp reconstruct a dense latent canvas from the selected tiles. The frozen FLUX.2 decoder turns that canvas into pixels. During encoding, the Judge checks the reconstruction against the ordinary FLUX.2 round trip, using the original as a reference. When a region fails, verification splits the affected leaves and decodes the revised layout. The CLI reports actual Judge evaluations in `judge_calls`.
+TileLift and TileUp reconstruct a dense latent canvas from the selected tiles. The frozen FLUX.2 decoder turns that canvas into pixels. During encoding, the Judge scores how far the reconstruction departs from the original beyond what the plain FLUX.2 round trip (all 1,024 grid tokens) already loses: every gate measures the decode's error against the original minus the round trip's own error. When a region fails, verification splits the affected leaves and decodes the revised layout. The CLI reports actual Judge evaluations in `judge_calls`.
 
 ![Tessera architecture showing the FLUX.2 latent grid, router proposal, tile reconstruction, and encode-time verification loop](docs/images/architecture.png)
 
@@ -95,7 +95,7 @@ On 24 images of the project's final evaluation set (GPU run, same flags, same ro
 - `--mode router`: the learned router (`--router`, `--leaf_bias`) predicts the layout, then `--verify` (default on, `--verify_rounds 8`) splits
   failing leaves, falling back to all 16 px tiles if rounds run out; `--no_verify` returns the router's layout and reports whether it passes.
   `--mode topdown` (the default mode, no router needed): start from the four 32 x 32 cell roots and split every leaf the Judge flags until
-  the decode passes (about 15x more Judge calls).  `--mode rdtree`: one-shot rate-distortion tree (`--rd_lambda 0.05 --rd_beta 0.5`), same verification.
+  the decode passes (about 15x more Judge calls).  `--mode rdtree`: one-shot rate-distortion tree (defaults `--rd_lambda 0.05 --rd_beta 0.5 --rd_tau 0`; the tuned setting in the lab report is `--rd_lambda 0.002 --rd_beta 3 --rd_tau 2.0`), same verification.
 - `--prune_merges`: after a pass, merge sibling leaves while the Judge still passes (`--prune_max_calls 48` Judge calls per image,
   `--prune_max_rounds 8`, `--prune_fast` skips bisecting failing chunks).  Fewer tokens, more Judge calls.
 - `--judge_scale 3.0`: tolerance multiplier of every Judge gate (lower is stricter).  Stricter variants, all off by default:
@@ -107,7 +107,7 @@ On 24 images of the project's final evaluation set (GPU run, same flags, same ro
 - 512 px only: other sizes are centre-cropped and resized to 512 x 512.
 - Tile vectors are used in memory. `results.json` records counts and quality metrics. The CLI reconstructs pixels during encoding and does not export a serialized token stream.
 - A CPU run takes minutes per image (each Judge call decodes a 512 px image and runs LPIPS-VGG / DISTS); use a GPU for more than a few images.
-- The Judge passes a layout when the decode matches the *FLUX.2 round trip*, not the original: the `go` metrics report the grid’s own reconstruction error against the source. A Judge pass indicates that the configured thresholds were met.  Fine text and photographed paintings keep many tokens.
+- The Judge measures *excess* error: the decode's error against the original minus the FLUX.2 round trip's own error, so the round trip is the quality ceiling. The `go` metrics report the grid’s own reconstruction error against the source. A Judge pass indicates that the configured thresholds were met.  Fine text and photographed paintings keep many tokens.
 - The router is a pilot trained on 279 labelled images (27 for validation).  Alone it is not usable: on 45 calibration images its layouts passed the
   Judge on 4.4 % (`--leaf_bias 0`) and 0 % (`0.5`) of images.  The result above is router + verification: verification repairs the layout with
   about 2-3 Judge calls instead of about 40 for `topdown` + pruning, at about the same token count.  Without `--verify` expect mostly failures.
