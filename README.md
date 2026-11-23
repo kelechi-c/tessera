@@ -47,7 +47,7 @@ PY
 tessera out --images images --ckpt weights/phase3_large_tl/step_20000.pt --prune_merges --prune_fast
 ```
 
-Expected (CPU, about 6-8 minutes on 8 cores; a GPU takes seconds):
+Expected (CPU, about 6-8 minutes on 8 cores; the CUDA path is untested in this release):
 
 ```
 [tessera] dev=cpu n=1 mode=topdown TileUp=22.18M RectTileDown=4.55M RectTileLift=0.78M
