@@ -1,20 +1,16 @@
 # Tessera
 
-Tessera encodes a 512 × 512 image as a variable number of rectangular latent tokens. Each token holds 128 values. A uniform FLUX.2 grid uses 1,024 tokens at this resolution. On 90 held-out images, the verified router averaged 369.6 tokens and 2.9 Judge checks per image. All 90 passed without falling back to the full grid.
+Tessera encodes a 512 × 512 image as a variable number of adaptive rectangular tiles on the FLUX.2 latent, using 128-float tokens instead of the uniform 1,024-token grid baseline. On 90 held-out images, the verified router averaged **369.6 tokens** and **2.9 Judge checks** per image, with all 90 passing without falling back to the full grid. Token counts adapt to content: **61 vs 1,021 tokens** for a clean Mondrian vs Where's Waldo at 512 px, and an **8.5× → 23.5×** Mondrian-vs-Waldo gap at matched sizes across a 512-block resolution ladder (512 to 4096 px).
 
 [Interactive demo](https://artifacts.kelechi.cc/tessera_demo_v2/) · [Article](https://artifacts.kelechi.cc/articles/tessera-content-adaptive-tokenization) · [Lab report](https://artifacts.kelechi.cc/articles/tessera-v2-lab-report)
 
-## Architecture
+## How it works
 
-The frozen FLUX.2 encoder maps the input to a 64 × 64 grid of 32-channel latent cells. TileDown computes candidate tile representations. The learned router proposes a rectangular partition across four roots, choosing where to keep a leaf or split it horizontally or vertically. Each selected leaf contributes one token.
-
-TileLift and TileUp reconstruct a dense latent canvas from the selected tiles. The frozen FLUX.2 decoder turns that canvas into pixels. During encoding, the Judge scores how far the reconstruction departs from the original beyond what the plain FLUX.2 round trip (all 1,024 grid tokens) already loses: every gate measures the decode's error against the original minus the round trip's own error. When a region fails, verification splits the affected leaves and decodes the revised layout. The CLI reports actual Judge evaluations in `judge_calls`.
+The frozen FLUX.2 encoder maps the image to a 64 × 64 × 32 latent grid, TileDown computes candidate tile features, and the router proposes a rectangular leaf partition. TileLift, TileUp, and the frozen FLUX.2 decoder reconstruct pixels, which the Judge scores for *excess* error over the plain FLUX.2 round trip and splits failing leaves until the decode passes.
 
 ![Tessera architecture showing the FLUX.2 latent grid, router proposal, tile reconstruction, and encode-time verification loop](docs/images/architecture.png)
 
-## An encoding example
-
-A 192 × 192 patch from a Veronese painting occupies 14% of a white 512 × 512 canvas. The router proposed **159 tiles**. After two Judge checks, the accepted layout used **164 tokens**, about **6.2× fewer** than the uniform grid. Reversing the example, with a white patch in the full painting, took 756 tokens. The full painting took 849. These counts describe layout leaves; the CLI does not measure compressed file size.
+For a 192 × 192 Veronese painting patch on a white 512 × 512 canvas, the router proposed 159 tiles and 2 Judge checks produced a passing layout of **164 tokens** (6.2× fewer than the 1,024-token grid).
 
 ![Veronese island input, final tile boundaries, grid reference, and verified reconstruction with matching detail crops](docs/images/encoding-example.png)
 
@@ -42,12 +38,11 @@ hf download tensorkelechi/tessera-checkpoints phase3_large_tl/step_20000.pt rout
 sha256sum weights/phase3_large_tl/step_20000.pt weights/router/router_rect.pt        # must match the table
 ```
 
-The tokenizer checkpoint is a pickled `torch.load(weights_only=False)` file: load only a file whose hash you have checked.  The router
-file holds tensors and plain numbers only and is loaded with `weights_only=True`.
+The tokenizer checkpoint uses `torch.load(weights_only=False)` (verify its sha256 first); the router uses `weights_only=True`.
 
-## Run a reproducible example
+## Quickstart
 
-This command creates a synthetic test image and runs the same verified-router settings as the demo.
+Generates a synthetic 512 × 512 Mondrian and runs the flagship verified-router settings (~1.5–4 min on 8 CPU cores):
 
 ```bash
 python - <<'PY'
@@ -74,26 +69,21 @@ Expected (CPU; the CUDA path is untested in this release):
 [tessera] 1/1 pass the Judge, mean 102.0 tokens -> out/results.json
 ```
 
-The 512 x 512 image costs 102 tokens: the router proposed 72, verification needed 4 Judge calls to reach a passing layout.  `results.json`
-reports PSNR 36.78 dB against the FLUX.2 round trip and 34.97 dB against the original (the round trip itself is 41.15 dB from the original).
-It takes about 1.5-4 minutes on 8 CPU cores.
+Outputs are written to `out/results.json` (token counts, `judge_calls`, and PSNR/SSIM/LPIPS/DISTS) and `out/strips/*.png`.
 
-`out/results.json` has, per image, the token count, Judge verdict, verification rounds (`calls`), actual Judge evaluations (`judge_calls` in router mode; `route_tok` is the router's layout
-before verification) and PSNR / SSIM / LPIPS / DISTS of the decode against the FLUX.2 round trip (`tg`), against the original (`to`) and of the
-round trip against the original (`go`).  `out/strips/*.png` shows original | decode | tile borders (colour = tile shape).
-`--save_layouts` also writes each layout (`shape_map` uint8 [2, 64, 64]: tile height and width in cells at every cell), the original, the
-decode and the round trip.
+## Options
 
-On 24 images of the project's final evaluation set (GPU run, same flags, same router), all 24 passed the Judge with a mean of 384 tokens and
-2.7 Judge calls per image; the router's own layouts averaged 328 tokens before verification.  A plain FLUX.2 latent is 1,024 tokens.
+`tessera OUT --images DIR --ckpt PATH [options]` — run `tessera --help` for the full list.
 
-## Higher resolutions
+- `--mode`: `topdown` (default, no router), `router` (with `--router` and `--leaf_bias`), or `rdtree`.
+- `--verify` / `--no_verify`, `--verify_rounds 8`: split failing leaves up to N rounds before falling back to 16 px tiles.
+- `--prune_merges`: merge sibling leaves after a pass while the Judge still passes (fewer tokens, more Judge calls).
+- `--judge_scale 3.0`: global tolerance multiplier; flagship strictness adds `--struct_scale`, `--color_floor_de`, `--color_max_floor_de`, and `--tu_spike_k`.
+- `--save_layouts`: save per-cell `shape_map` arrays alongside images.
 
-The CLI is 512 px only. To measure larger images the lab cut each one into independent 512 x 512 blocks, ran this CLI on every block (router mode, the strict flagship flags above, verification on; all 369 blocks of the five classes below passed, 0 fallbacks) and compared the token total with the blockwise FLUX.2 grid (1,024 tokens per block). This is a measurement wrapper around the CLI, not a feature of it.
+## Higher resolutions (512-block encodes)
 
-![Compression ratio against the FLUX grid, 512 to 4096 px](docs/images/resolution-ladder.png)
-
-Tokens (times fewer than the blockwise grid):
+Measured by running the 512 px CLI independently on each 512 × 512 block (369/369 blocks passed, 0 fallbacks). Tokens (compression vs blockwise FLUX grid):
 
 | image class | 512 | 1024 | 2048 | 4096 |
 |---|---|---|---|---|
@@ -104,43 +94,13 @@ Tokens (times fewer than the blockwise grid):
 | dense painting | 629 (1.6x) | 2,431 (1.7x) | 10,309 (1.6x) | 26,537 (1.5x) |
 | Where's Waldo (4K page) | 1,023 (1.0x) | 4,065 (1.0x) | 15,783 (1.0x) | 30,904 (1.1x) |
 
-Flat blue is 64x at every size. The painting's 4096 rung is 4096 x 2560 and Waldo's is 4096 x 2048 (both source pages are wider than tall); the other 4096 rungs are 4096 x 4096. At the same pixel size the Mondrian takes 120, 295, 837 and 1,317 tokens against 1,023, 4,065, 15,783 and 30,904 for Waldo (4096 x 2048 at the last step), a gap of 8.5x growing to 23.5x.
-
-![Mondrian and Where's Waldo tokens at the same size](docs/images/resolution-mondrian-vs-waldo.png)
-
-Per 512 px block on an RTX 4090: VAE encode about 14 ms, router 13-24 ms, verify loop 0.06-0.28 s (1-4 Judge calls), tile decode 45-56 ms against 39.5 ms for the plain FLUX decode.
-
-Caveats:
-
-- Blocks are encoded and verified independently, with no cross-block context. Block borders can show a step; the blockwise FLUX grid has the same seams, and Tessera adds about 0.2-1.2 levels of border error on top on smooth, sparse and Waldo content (about 2 on the dense painting). A native full-image FLUX round trip has no seams.
-- Dense real images stay near 1-1.7x at every size.
-- The 61 versus 1,021 tokens at 512 px (a clean Mondrian against a Waldo page) is a separate, unchanged result; the ladder's Mondrian is a different, synthetic scene (120 tokens at 512 px).
-- One scene per class, no confidence intervals; the Judge reference is the blockwise FLUX round trip of the same block.
-
-## Options
-
-`tessera OUT --images DIR --ckpt PATH [options]` (`tessera --help` lists all; defaults shown; the defaults are the Judge's default tolerance
-`--judge_scale 3.0` and `topdown`, so the flagship flags above are given explicitly).
-
-- `--mode router`: the learned router (`--router`, `--leaf_bias`) predicts the layout, then `--verify` (default on, `--verify_rounds 8`) splits
-  failing leaves, falling back to all 16 px tiles if rounds run out; `--no_verify` returns the router's layout and reports whether it passes.
-  `--mode topdown` (the default mode, no router needed): start from the four 32 x 32 cell roots and split every leaf the Judge flags until
-  the decode passes (about 15x more Judge calls).  `--mode rdtree`: one-shot rate-distortion tree (defaults `--rd_lambda 0.05 --rd_beta 0.5 --rd_tau 0`; the tuned setting in the lab report is `--rd_lambda 0.002 --rd_beta 3 --rd_tau 2.0`), same verification.
-- `--prune_merges`: after a pass, merge sibling leaves while the Judge still passes (`--prune_max_calls 48` Judge calls per image,
-  `--prune_max_rounds 8`, `--prune_fast` skips bisecting failing chunks).  Fewer tokens, more Judge calls.
-- `--judge_scale 3.0`: tolerance multiplier of every Judge gate (lower is stricter).  Stricter variants, all off by default:
-  `--struct_scale`, `--color_floor_de`, `--color_max_floor_de`, `--mae32_limit`; `--tu_spike_k` clips isolated TileUp spikes.
-  The strict bar of the flagship example is `--judge_scale 1.0 --struct_scale 1.5 --color_floor_de 1.0 --color_max_floor_de 1.8 --tu_spike_k 3`.
+Painting and Waldo 4096 rungs are 4096 × 2560 and 4096 × 2048; at matched sizes, Mondrian takes 120–1,317 tokens vs Waldo's 1,023–30,904 (8.5× → 23.5×).
 
 ## Limits
 
-- 512 px only: other sizes are centre-cropped and resized to 512 x 512 (see Higher resolutions for tiling larger images into 512 px blocks).
-- Tile vectors are used in memory. `results.json` records counts and quality metrics. The CLI reconstructs pixels during encoding and does not export a serialized token stream.
-- A CPU run takes minutes per image (each Judge call decodes a 512 px image and runs LPIPS-VGG / DISTS); use a GPU for more than a few images.
-- The Judge measures *excess* error: the decode's error against the original minus the FLUX.2 round trip's own error, so the round trip is the quality ceiling. The `go` metrics report the grid’s own reconstruction error against the source. A Judge pass indicates that the configured thresholds were met.  Fine text and photographed paintings keep many tokens.
-- The router is a pilot trained on 279 labelled images (27 for validation).  Alone it is not usable: on 45 calibration images its layouts passed the
-  Judge on 4.4 % (`--leaf_bias 0`) and 0 % (`0.5`) of images.  The result above is router + verification: verification repairs the layout with
-  about 2-3 Judge calls instead of about 40 for `topdown` + pruning, at about the same token count.  Without `--verify` expect mostly failures.
-  One-shot `rdtree` layouts passed 0-76 % depending on the setting.
-- Flagship layouts are not pruned (`--prune_merges` would lower the token count at the cost of many more Judge calls).
-- Training code, datasets and the evaluation write-ups are not part of this package.
+- **512-px CLI**: other input sizes are centre-cropped and resized to 512 × 512.
+- **Higher-res is blockwise with seams**: independent 512 × 512 blocks have no cross-block context, adding ~0.2–2 levels of border step error.
+- **Encode needs the Judge and real decoder**: encoding decodes pixels to score excess error over the FLUX.2 round trip and does not export a serialized token stream.
+- **Router alone rarely passes without `--verify`**: on 45 calibration images, the pilot router passed only 0–4.4% unverified; verification repairs layouts in ~2.9 Judge checks.
+- **CPU is slow**: each Judge check decodes 512 px and runs LPIPS/DISTS (minutes per image on CPU); use a GPU for batches.
+- **Package scope**: training code, datasets, and full evaluation write-ups live outside this repo (see the [Article](https://artifacts.kelechi.cc/articles/tessera-content-adaptive-tokenization) and [Lab report](https://artifacts.kelechi.cc/articles/tessera-v2-lab-report)).
