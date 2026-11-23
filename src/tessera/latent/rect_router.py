@@ -51,14 +51,15 @@ class LatentRouterRect(nn.Module):
 
     IN_CH = RL.CH + len(RL.COARSE_SHAPES)                                     # 32 + 12 = 44
 
-    def __init__(self, in_ch=IN_CH, width=96, dilations=(1, 2, 4, 8, 2, 1)):
+    def __init__(self, in_ch=IN_CH, width=96, dilations=(1, 2, 4, 8, 2, 1), maxpool_feats=False):
         super().__init__()
         self.in_ch, self.width = int(in_ch), int(width)
+        self.maxpool_feats = bool(maxpool_feats)                              # EXPERIMENT: append box max-pool to node feats
         self.stem = nn.Conv2d(self.in_ch, self.width, 3, padding=1)
         self.blocks = nn.Sequential(*[_DilBlock(self.width, d) for d in dilations])
         self.norm = nn.GroupNorm(8, self.width)
         self.shape_mlp = nn.Sequential(nn.Linear(4, self.width), nn.SiLU(), nn.Linear(self.width, self.width))
-        self.head = nn.Linear(self.width, 3)                                  # {0: leaf, 1: split-H, 2: split-V}
+        self.head = nn.Linear(self.width * (2 if self.maxpool_feats else 1), 3)   # {0: leaf, 1: split-H, 2: split-V}
 
     def encode_grid(self, feat):
         return F.silu(self.norm(self.blocks(self.stem(feat))))                # [B, W, 64, 64]
@@ -78,10 +79,31 @@ class LatentRouterRect(nn.Module):
         lsh = torch.log2(sh.to(p.dtype) / 2.0)
         lsw = torch.log2(sw.to(p.dtype) / 2.0)
         s4 = torch.stack((lsh, lsw, lsh + lsw, lsh - lsw), dim=1)             # [N, 4]
+        if self.maxpool_feats:
+            mp = self._box_max(h_1, nodes)                                    # [N, W]
+            return self.head(torch.cat([p + self.shape_mlp(s4), mp], dim=1))
         return self.head(p + self.shape_mlp(s4))                              # [N, 3]
 
-    def loss(self, feat, shape_maps):
-        """Supervised 3-way cross-entropy over all non-(2,2) visited nodes of ground-truth `shape_maps` [B,2,64,64]."""
+    @staticmethod
+    def _box_max(h_1, nodes):
+        """Per-node max over its box of `h_1` [W, 64, 64] -> [N, W] (nodes are tile-aligned, so a strided max-pool per shape)."""
+        out = h_1.new_zeros((len(nodes), h_1.shape[0]))
+        by_shape = {}
+        for i, (r0, c0, sh, sw) in enumerate(nodes):
+            by_shape.setdefault((sh, sw), []).append((i, r0 // sh, c0 // sw))
+        for (sh, sw), items in by_shape.items():
+            pooled = F.max_pool2d(h_1.unsqueeze(0), (sh, sw), stride=(sh, sw))[0]   # [W, 64/sh, 64/sw]
+            idx = torch.tensor([i for i, _, _ in items], device=h_1.device)
+            rr = torch.tensor([a for _, a, _ in items], device=h_1.device)
+            cc = torch.tensor([b for _, _, b in items], device=h_1.device)
+            out[idx] = pooled[:, rr, cc].transpose(0, 1).to(out.dtype)
+        return out
+
+    def loss(self, feat, shape_maps, node_weight=None):
+        """Supervised 3-way cross-entropy over all non-(2,2) visited nodes of ground-truth `shape_maps` [B,2,64,64].
+
+        `node_weight=None` (default): every node counts equally.  `"area_pow"`: weight (sh*sw)**0.5 per node,
+        normalised by the summed weight (big nodes count more, so a shattered flat quadrant no longer dominates)."""
         h = self.encode_grid(feat)
         dev = h.device
         tot, count = h.new_zeros(()), 0
@@ -97,13 +119,22 @@ class LatentRouterRect(nn.Module):
             sh_t = torch.tensor([sh for _, _, sh, _ in nodes], dtype=torch.long, device=dev)
             sw_t = torch.tensor([sw for _, _, _, sw in nodes], dtype=torch.long, device=dev)
             logits = logits.masked_fill(~RL.valid_action_mask(sh_t, sw_t), -1e9)
-            tot = tot + F.cross_entropy(logits, targets, reduction="sum")
-            count += len(targets)
+            if node_weight is None:
+                tot = tot + F.cross_entropy(logits, targets, reduction="sum")
+                count += len(targets)
+            else:
+                if node_weight != "area_pow":
+                    raise ValueError(f"unknown node_weight {node_weight!r}")
+                w = (sh_t * sw_t).to(logits.dtype).sqrt()
+                tot = tot + (F.cross_entropy(logits, targets, reduction="none") * w).sum()
+                count += float(w.sum())
         return tot / max(count, 1)
 
     @torch.no_grad()
-    def route(self, feat, leaf_bias=0.0):
-        """One-pass top-down decode -> guaranteed-valid 2:1 k-d tree `shape_map` [B, 2, 64, 64]."""
+    def route(self, feat, leaf_bias=0.0, leaf_bias_slope=0.0):
+        """One-pass top-down decode -> guaranteed-valid 2:1 k-d tree `shape_map` [B, 2, 64, 64].
+
+        `leaf_bias_slope` (default 0 = off): leaf logit += leaf_bias + slope * log2(sh*sw) per node (affine in log area)."""
         h = self.encode_grid(feat)
         b = h.shape[0]
         out = torch.zeros((b, 2, RL.SIDE, RL.SIDE), dtype=torch.long, device=h.device)
@@ -112,11 +143,14 @@ class LatentRouterRect(nn.Module):
             frontier = [(0, 0, 32, 32), (0, 32, 32, 32), (32, 0, 32, 32), (32, 32, 32, 32)]
             while frontier:
                 logits = self.node_logits(h[bi], frontier, sat=sat)
-                if leaf_bias != 0.0:
-                    logits = logits.clone()
-                    logits[:, RL.ACT_LEAF] += float(leaf_bias)
                 sh_t = torch.tensor([sh for _, _, sh, _ in frontier], dtype=torch.long, device=h.device)
                 sw_t = torch.tensor([sw for _, _, _, sw in frontier], dtype=torch.long, device=h.device)
+                if leaf_bias != 0.0 and leaf_bias_slope == 0.0:
+                    logits = logits.clone()
+                    logits[:, RL.ACT_LEAF] += float(leaf_bias)
+                elif leaf_bias_slope != 0.0:
+                    logits = logits.clone()
+                    logits[:, RL.ACT_LEAF] += float(leaf_bias) + float(leaf_bias_slope) * torch.log2((sh_t * sw_t).to(logits.dtype))
                 logits = logits.masked_fill(~RL.valid_action_mask(sh_t, sw_t), -1e9)
                 acts = logits.argmax(dim=-1).tolist()
                 nxt = []

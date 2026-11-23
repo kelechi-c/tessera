@@ -292,14 +292,32 @@ def encode_rect_pyramid(z512n, basis):
     return pyr
 
 
-def tile_ac_gate_rect(tok_grid, sh, sw, entry, floor=0.20, tau=0.20):
+def tile_ac_gate_rect(tok_grid, sh, sw, entry, floor=0.20, tau=0.20, gate_scale="token"):
     """Smooth dead-zone non-planar energy gate in [0, 1] per tile -> [B, 1, nh, nw].
 
     Subtracts the 3-mode linear plane (DC + y + x) on ALL 12 coarse shapes before measuring residual RMS, so both
-    flat Mondrian boxes AND smooth linear sky gradients stay exact 0 while edges/textures open smoothly to 1."""
+    flat Mondrian boxes AND smooth linear sky gradients stay exact 0 while edges/textures open smoothly to 1.
+
+    `gate_scale` (plane_pca32 shapes only; dc_pca96 is always per-pixel): `"token"` (default, what the checkpoints
+    were trained with) measures the RMS over the 32 PCA coefficients; `"pixel"` (eval-time experiment) lifts them to
+    the `[32, sh*sw]` residual, removes the plane and measures the per-pixel RMS, the scale of the encoder's input
+    gate (`rect_tiledown._input_nonplanar_gate`), so flat tiles fall under `floor`; `"pixel_close"` keeps the token
+    gate but forces it to 0 on tiles whose per-pixel non-planar RMS is <= `floor` (flat tiles closed, edges and
+    texture keep the trained gate)."""
     b, nh, nw, _ = tok_grid.shape
     tok = tok_grid.float()
-    if entry["mode"] == "plane_pca32":
+    if entry["mode"] == "plane_pca32" and gate_scale == "pixel_close":
+        g_tok = tile_ac_gate_rect(tok_grid, sh, sw, entry, floor=floor, tau=tau, gate_scale="token")
+        g_pix = tile_ac_gate_rect(tok_grid, sh, sw, entry, floor=floor, tau=tau, gate_scale="pixel")
+        return g_tok * (g_pix > 0).to(g_tok.dtype)
+    if entry["mode"] == "plane_pca32" and gate_scale == "pixel":
+        m = b * nh * nw
+        U = entry["U"].to(device=tok.device, dtype=torch.float32)
+        r_hat = (tok.reshape(m, TOK)[:, CH * 3:] @ U.T).view(m, CH, sh * sw)
+        P = _plane_basis_1d(sh, sw, tok.device, torch.float32)
+        non_planar = r_hat - (r_hat @ P.T) @ P
+        rms = non_planar.square().mean(dim=(-2, -1)).clamp_min(1e-12).sqrt().view(b, nh, nw)
+    elif entry["mode"] == "plane_pca32":
         res = tok[..., CH * 3:]                                               # 32 non-planar residual coeffs
         rms = res.square().mean(dim=-1).clamp_min(1e-12).sqrt()               # [B, nh, nw]
     else:
@@ -345,8 +363,10 @@ def tile_border_masks(shape_map):
     return bx_c, by_c, b1.float()
 
 
-def build_rect_canvas(rect_pyr, shape_map, basis, floor=0.20, tau=0.20, border_open=False):
-    """Build (canvas [B,32,64,64], mask [B,1,64,64], shape_feat [B,4,64,64], pos [B,2,64,64], ac_gate [B,1,64,64])."""
+def build_rect_canvas(rect_pyr, shape_map, basis, floor=0.20, tau=0.20, border_open=False, gate_scale="token"):
+    """Build (canvas [B,32,64,64], mask [B,1,64,64], shape_feat [B,4,64,64], pos [B,2,64,64], ac_gate [B,1,64,64]).
+
+    `gate_scale`: see `tile_ac_gate_rect` (default `"token"`)."""
     z2 = lift_rect_tokens(rect_pyr[(2, 2)], 2, 2, None)
     b, _, _, _ = z2.shape
     dev, dt = z2.device, z2.dtype
@@ -359,7 +379,7 @@ def build_rect_canvas(rect_pyr, shape_map, basis, floor=0.20, tau=0.20, border_o
         if bool(m.any()):
             up = lift_rect_tokens(rect_pyr[(sh, sw)], sh, sw, entry)
             canvas = torch.where(m[:, None], up, canvas)
-            g = tile_ac_gate_rect(rect_pyr[(sh, sw)], sh, sw, entry, floor=floor, tau=tau)
+            g = tile_ac_gate_rect(rect_pyr[(sh, sw)], sh, sw, entry, floor=floor, tau=tau, gate_scale=gate_scale)
             g_up = g.repeat_interleave(sh, dim=-2).repeat_interleave(sw, dim=-1)
             ac_gate = torch.where(m[:, None], g_up, ac_gate)
 
