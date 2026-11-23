@@ -87,6 +87,36 @@ decode and the round trip.
 On 24 images of the project's final evaluation set (GPU run, same flags, same router), all 24 passed the Judge with a mean of 384 tokens and
 2.7 Judge calls per image; the router's own layouts averaged 328 tokens before verification.  A plain FLUX.2 latent is 1,024 tokens.
 
+## Higher resolutions
+
+The CLI is 512 px only. To measure larger images the lab cut each one into independent 512 x 512 blocks, ran this CLI on every block (router mode, the strict flagship flags above, verification on; all 369 blocks of the five classes below passed, 0 fallbacks) and compared the token total with the blockwise FLUX.2 grid (1,024 tokens per block). This is a measurement wrapper around the CLI, not a feature of it.
+
+![Compression ratio against the FLUX grid, 512 to 4096 px](docs/images/resolution-ladder.png)
+
+Tokens (times fewer than the blockwise grid):
+
+| image class | 512 | 1024 | 2048 | 4096 |
+|---|---|---|---|---|
+| FLUX grid tokens | 1,024 | 4,096 | 16,384 | 65,536 |
+| smooth sky (synthetic) | 69 (14.8x) | 102 (40.2x) | 270 (60.7x) | 825 (79.4x) |
+| clean Mondrian (synthetic) | 120 (8.5x) | 295 (13.9x) | 837 (19.6x) | 2,253 (29.1x) |
+| text slide | 368 (2.8x) | 980 (4.2x) | 2,057 (8.0x) | 4,283 (15.3x) |
+| dense painting | 629 (1.6x) | 2,431 (1.7x) | 10,309 (1.6x) | 26,537 (1.5x) |
+| Where's Waldo (4K page) | 1,023 (1.0x) | 4,065 (1.0x) | 15,783 (1.0x) | 30,904 (1.1x) |
+
+Flat blue is 64x at every size. The painting's 4096 rung is 4096 x 2560 and Waldo's is 4096 x 2048 (both source pages are wider than tall); the other 4096 rungs are 4096 x 4096. At the same pixel size the Mondrian takes 120, 295, 837 and 1,317 tokens against 1,023, 4,065, 15,783 and 30,904 for Waldo (4096 x 2048 at the last step), a gap of 8.5x growing to 23.5x.
+
+![Mondrian and Where's Waldo tokens at the same size](docs/images/resolution-mondrian-vs-waldo.png)
+
+Per 512 px block on an RTX 4090: VAE encode about 14 ms, router 13-24 ms, verify loop 0.06-0.28 s (1-4 Judge calls), tile decode 45-56 ms against 39.5 ms for the plain FLUX decode.
+
+Caveats:
+
+- Blocks are encoded and verified independently, with no cross-block context. Block borders can show a step; the blockwise FLUX grid has the same seams, and Tessera adds about 0.2-1.2 levels of border error on top on smooth, sparse and Waldo content (about 2 on the dense painting). A native full-image FLUX round trip has no seams.
+- Dense real images stay near 1-1.7x at every size.
+- The 61 versus 1,021 tokens at 512 px (a clean Mondrian against a Waldo page) is a separate, unchanged result; the ladder's Mondrian is a different, synthetic scene (120 tokens at 512 px).
+- One scene per class, no confidence intervals; the Judge reference is the blockwise FLUX round trip of the same block.
+
 ## Options
 
 `tessera OUT --images DIR --ckpt PATH [options]` (`tessera --help` lists all; defaults shown; the defaults are the Judge's default tolerance
@@ -104,7 +134,7 @@ On 24 images of the project's final evaluation set (GPU run, same flags, same ro
 
 ## Limits
 
-- 512 px only: other sizes are centre-cropped and resized to 512 x 512.
+- 512 px only: other sizes are centre-cropped and resized to 512 x 512 (see Higher resolutions for tiling larger images into 512 px blocks).
 - Tile vectors are used in memory. `results.json` records counts and quality metrics. The CLI reconstructs pixels during encoding and does not export a serialized token stream.
 - A CPU run takes minutes per image (each Judge call decodes a 512 px image and runs LPIPS-VGG / DISTS); use a GPU for more than a few images.
 - The Judge measures *excess* error: the decode's error against the original minus the FLUX.2 round trip's own error, so the round trip is the quality ceiling. The `go` metrics report the grid’s own reconstruction error against the source. A Judge pass indicates that the configured thresholds were met.  Fine text and photographed paintings keep many tokens.
