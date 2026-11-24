@@ -11,11 +11,6 @@ from tessera.rect.model import CH, TileUp
 IN_CH_RECT = CH + 4 + 2 + 1      # TileUp input channels of the rectangular tokenizer: canvas, shape (4), position, noise
 
 
-def _leaf_err_sum(err_maps, t):
-    r0, c0, sh, sw = t
-    return float(err_maps[(sh, sw)][r0:r0 + sh, c0:c0 + sw].sum())
-
-
 def apply_sibling_merges(shape_map, parents):
     """Return a copy of `shape_map` [1, 2, 64, 64] with each parent region painted as one `(sh, sw)` leaf."""
     sm = shape_map.clone()
@@ -50,17 +45,19 @@ def compute_lift_err_maps(z512_1, rect_pyr_n, basis_dev, mv, sv, tilelift=None, 
     return err_maps
 
 
-def load_tokenizer_ckpt(ckpt_path, dev):
+def load_tokenizer_ckpt(ckpt_path, dev, load_tiledown=True):
     """Load the EMA `(TileUp, RectTileDown, basis_dev, mean, std, basis_cpu)` from a `tileup_rect.pt` checkpoint.
 
     Stage 1b metadata (`td_1d_pool`, `td_prof_c`, `td_prof_len`, `td_dc_lock`, `zero_mean_resid`, `ac_floor`,
     `ac_tau`; legacy defaults `False, 16, 32, False, False, 0.20, 0.20`) is attached as plain attributes:
     `tu._zero_mean_resid`, `tu._ac_floor`, `tu._ac_tau` and `td.ac_floor`, `td.ac_tau`.  A `RectTileLift`
-    (`"tilelift"` + `tl_hid`, `tl_rank`, `tl_prof_len`) is attached as `tu._tilelift` (`None` when absent)."""
+    (`"tilelift"` + `tl_hid`, `tl_rank`, `tl_prof_len`) is attached as `tu._tilelift` (`None` when absent).
+    Pass `load_tiledown=False` on decode-only paths to skip instantiating `RectTileDown`."""
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     widths = tuple(int(x) for x in ck.get("widths", (128, 192, 256)))
     attn_blocks = int(ck.get("attn_blocks", 2))
-    tu = TileUp(c=widths, in_ch=IN_CH_RECT, attn_blocks=attn_blocks).to(dev)
+    attn_32 = bool(ck.get("attn_32", False))
+    tu = TileUp(c=widths, in_ch=IN_CH_RECT, attn_blocks=attn_blocks, attn_32=attn_32).to(dev)
     tu.load_state_dict(ck["model"])
     tu.eval().requires_grad_(False)
     ac_floor = float(ck.get("ac_floor", 0.20))
@@ -69,7 +66,7 @@ def load_tokenizer_ckpt(ckpt_path, dev):
     tu._ac_floor, tu._ac_tau = ac_floor, ac_tau
 
     td = None
-    if "tiledown" in ck:
+    if load_tiledown and "tiledown" in ck:
         td = RTD.RectTileDown(
             c=int(ck.get("td_c", 96)), hid=int(ck.get("td_hid", 256)),
             use_1d_pool=bool(ck.get("td_1d_pool", False)), prof_c=int(ck.get("td_prof_c", 16)),
@@ -209,7 +206,7 @@ def prune_kdtree_siblings_td(model, tiledown, z512_1, basis_dev, mean, std, dec,
                 continue
             bad = ev_try.get("bad8")
             if bad is not None and tuple(bad.shape[-2:]) == (RL.SIDE, RL.SIDE):
-                bad_b = bad.reshape(RL.SIDE, RL.SIDE).bool().cpu()
+                bad_b = torch.as_tensor(bad).reshape(RL.SIDE, RL.SIDE).bool().cpu()
                 dirty = [p for p in chunk if _touches(bad_b, p)]
                 clean = [p for p in chunk if not _touches(bad_b, p)]
                 if dirty and (clean or not bisect_dirty):
@@ -298,7 +295,7 @@ def split_kdtree_topdown_td(model, tiledown, z512_1, basis_dev, mean, std, dec, 
     calls = 0
     y_cur, ev_cur, sm = None, None, None
 
-    for _ in range(max_rounds):
+    for _ in range(max(1, int(max_rounds))):
         sm = torch.zeros((1, 2, RL.SIDE, RL.SIDE), dtype=torch.long, device=dev)
         for r0, c0, sh, sw in leaves:
             sm[0, 0, r0:r0 + sh, c0:c0 + sw] = sh
@@ -317,7 +314,7 @@ def split_kdtree_topdown_td(model, tiledown, z512_1, basis_dev, mean, std, dec, 
         bad = ev_cur.get("bad8")
         to_split = []
         if bad is not None:
-            bad_b = bad.to(dev).bool()
+            bad_b = torch.as_tensor(bad, device=dev, dtype=torch.bool)
             to_split = [t for t in splittable if bool(bad_b[t[0]:t[0] + t[2], t[1]:t[1] + t[3]].any())]
         if not to_split:
             scored = sorted(
@@ -356,7 +353,7 @@ def split_kdtree_topdown_td(model, tiledown, z512_1, basis_dev, mean, std, dec, 
 
 
 def _shapes(root):
-    out, sh, sw = [], root, root
+    out = []
     todo = [(root, root)]
     seen = set()
     while todo:

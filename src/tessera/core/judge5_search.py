@@ -12,6 +12,7 @@ Attribution (per failing gate g, i.e. excess_g / scale_g > T; cells are 8 px):
   lpips cells in grain windows count as zero (the same weights as the verdict).
 """
 import json
+import os
 import pathlib
 
 import numpy as np
@@ -30,8 +31,8 @@ class Frozen:
         d = json.loads(pathlib.Path(path).read_text())
         d = d.get("frozen", d)
         self.T = float(d["T"])
-        if __import__("os").environ.get("J5_T"):                 # tightening sweep: override the threshold, scales unchanged
-            self.T = float(__import__("os").environ["J5_T"])
+        if os.environ.get("J5_T"):                 # tightening sweep: override the threshold, scales unchanged
+            self.T = float(os.environ["J5_T"])
         self.thr = d["grain_thr"]
         self.scale = np.array([d["scale"][k] for k in R.KEYS], np.float64)
         self.path = str(path)

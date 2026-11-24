@@ -144,20 +144,21 @@ def nparams(m):
     return sum(p.numel() for p in m.parameters())
 
 
-def decoder_only_flux(dev):
-    """FLUX.2 VAE decoder (`black-forest-labs/FLUX.2-dev`, gated) without the encoder weights."""
-    from diffusers import AutoencoderKLFlux2
+def decoder_only_flux(dev, vae=None, repo_id=None):
+    """FLUX.2 VAE decoder (default: public `tensorkelechi/tessera-checkpoints`, subfolder `vae`) without encoder weights."""
+    if vae is None:
+        from tessera.rect.hub import DEFAULT_REPO_ID, load_flux_vae
 
-    vae = AutoencoderKLFlux2.from_pretrained(
-        "black-forest-labs/FLUX.2-dev", subfolder="vae", torch_dtype=torch.float32
-    )
+        vae = load_flux_vae(repo_id=DEFAULT_REPO_ID if repo_id is None else repo_id)
     vae.encoder = None
     if hasattr(vae, "quant_conv"):
         vae.quant_conv = None
-    vae = vae.to(dev).eval().requires_grad_(False)
+    dev_t = torch.device(dev)
+    use_cuda = dev_t.type == "cuda"
+    vae = vae.to(dev_t).eval().requires_grad_(False)
 
     def dec(z):
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=str(dev).startswith("cuda")):
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_cuda):
             return vae.decode(z).sample.clamp(-1, 1)
 
     dec.vae = vae

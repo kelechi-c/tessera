@@ -29,7 +29,7 @@ class Judge:
         from tessera.core import judge5_search as S
 
         scale = float(judge_scale)
-        judge5_sweep.LIM = 2.5 * scale
+        mae32_lim = 2.5 * scale
         fr = S.Frozen(str(pathlib.Path(__file__).resolve().parents[1] / "data" / "frozen_v5.json"))
         fr.T = float(fr.T) * scale
         self.struct_scale = None if struct_scale is None else float(struct_scale)
@@ -39,7 +39,7 @@ class Judge:
             keys = list(S.R.KEYS)
             fr.scale = np.array(fr.scale, np.float64, copy=True)
             if self.struct_scale is not None:
-                judge5_sweep.LIM = 2.5 * self.struct_scale
+                mae32_lim = 2.5 * self.struct_scale
                 for i, k in enumerate(keys):
                     if not k.startswith("color_"):
                         fr.scale[i] *= self.struct_scale / scale
@@ -48,10 +48,12 @@ class Judge:
                     i = keys.index(k)
                     fr.scale[i] = max(float(fr.scale[i]), fl / fr.T)
         if mae32_limit is not None:      # EXPERIMENT: absolute mae32 limit (RGB levels), overrides 2.5*scale; None = unchanged
-            judge5_sweep.LIM = float(mae32_limit)
-        self.mae32_lim = judge5_sweep.LIM
+            mae32_lim = float(mae32_limit)
+        judge5_sweep.LIM = mae32_lim
+        self.mae32_lim = mae32_lim
         self.fr = fr
         self.fc = Fa.FastContext(x_u8, g_u8, fr.thr, dev).bind(fr)
+        self.fc._mae32_lim = self.mae32_lim
         self.judge_scale = scale
         self.dev = dev
 

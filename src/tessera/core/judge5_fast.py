@@ -127,9 +127,13 @@ class FastContext:
         with torch.no_grad(), torch.backends.mkldnn.flags(enabled=False):
             J.DEV = str(dev)
             M = J._models(False)
-            if next(M["lp"].parameters()).device != torch.device(dev):
-                M["lp"] = M["lp"].to(dev)
-                M["dists"] = M["dists"].to(dev)
+            cur_dev = next(M["lp"].parameters()).device
+            want_dev = torch.device(dev)
+            if want_dev.type == "cuda" and want_dev.index is None:
+                want_dev = torch.device("cuda", torch.cuda.current_device())
+            if cur_dev.type != want_dev.type or (want_dev.index is not None and cur_dev.index != want_dev.index):
+                M["lp"] = M["lp"].to(want_dev)
+                M["dists"] = M["dists"].to(want_dev)
             self.M, self.lp = M, M["lp"]
             self.alpha = [a.to(dev) for a in M["alpha"]]
             self.H, self.W = x_u8.shape[:2]

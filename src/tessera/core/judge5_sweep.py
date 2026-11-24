@@ -19,9 +19,13 @@ LIM = float(os.environ.get("J5_MAE32", "2.5") or 0)   # tessera: mae32 gate on b
 class FastContextM(_Orig):
     def __init__(self, x_u8, g_u8, thr, dev):
         super().__init__(x_u8, g_u8, thr, dev)
+        self._mae32_lim = None
         self.ux_f = torch.from_numpy(np.ascontiguousarray(x_u8)).to(dev).float()
         self.ux = self.ux_f.to(torch.uint8)
         self.mg = self._mae_batch(torch.from_numpy(np.ascontiguousarray(g_u8)).to(dev)[None])[0]
+
+    def _lim(self):
+        return LIM if self._mae32_lim is None else self._mae32_lim
 
     def _mae_batch(self, u_b):
         e = (u_b.float() - self.ux_f[None]).abs().mean(3)
@@ -31,7 +35,8 @@ class FastContextM(_Orig):
         return self._mae_batch(u[None])[0]
 
     def evaluate_u8_batch(self, uys, attribute=True, chunk=8):
-        if LIM <= 0:
+        lim = self._lim()
+        if lim <= 0:
             return super().evaluate_u8_batch(uys, attribute=attribute, chunk=chunk)
         B = int(uys.shape[0])
         if B == 0:
@@ -48,7 +53,7 @@ class FastContextM(_Orig):
             mx_b = m_b.amax((1, 2))
         z_b = (v_b / self._sc_t()[None]).cpu().numpy()
         mx_np = mx_b.cpu().numpy()
-        zm_scale = LIM / self.fr_T
+        zm_scale = lim / self.fr_T
         out = []
         for idx in range(B):
             z = z_b[idx]
@@ -66,13 +71,14 @@ class FastContextM(_Orig):
                         if z.max() > self.fr_T:
                             arrs_i = {k: val[idx] for k, val in arrs_b.items()}
                             bad |= self.attribution(arrs_i, z, self._fr)
-                        bad |= (m_b[idx] > LIM).repeat_interleave(4, 0).repeat_interleave(4, 1)
+                        bad |= (m_b[idx] > lim).repeat_interleave(4, 0).repeat_interleave(4, 1)
                 r["bad8"] = bad
             out.append(r)
         return out
 
     def passes_u8_batch(self, uys, pre_pass=None, chunk=8):
-        if LIM <= 0:
+        lim = self._lim()
+        if lim <= 0:
             return super().passes_u8_batch(uys, pre_pass=pre_pass, chunk=chunk)
         B = int(uys.shape[0])
         if B == 0:
@@ -80,7 +86,7 @@ class FastContextM(_Orig):
         with torch.no_grad():
             m_b = self._mae_batch(uys) - self.mg[None]
             mx_b = m_b.amax((1, 2))
-            zm_scale = LIM / self.fr_T
+            zm_scale = lim / self.fr_T
             mae_ok = ((mx_b.double() / zm_scale) <= self.fr_T).cpu().tolist()
         if pre_pass is not None:
             mae_ok = [bool(a and b) for a, b in zip(mae_ok, pre_pass)]

@@ -33,6 +33,7 @@ Original-side maps (functions of x only, window fractions in [0, 1]):
 import hashlib
 import math
 import os
+import sys
 
 import numpy as np
 import torch
@@ -50,13 +51,24 @@ _M = {}
 DEV = os.environ.get("JUDGE5_DEVICE", "cpu")      # "cuda": the networks (LPIPS, DISTS, DINO) run on the GPU in fp32, everything else on CPU
 
 
+def load_dists_model(dev=None):
+    """Load DISTS_pytorch using package-local weights.pt (avoids DISTS()'s brittle sys.prefix lookup)."""
+    import DISTS_pytorch
+    from DISTS_pytorch import DISTS
+
+    m = DISTS(load_weights=False)
+    pkg_w = os.path.join(os.path.dirname(DISTS_pytorch.__file__), "weights.pt")
+    w_path = pkg_w if os.path.exists(pkg_w) else os.path.join(sys.prefix, "weights.pt")
+    w = torch.load(w_path, map_location="cpu", weights_only=True)
+    m.alpha.data, m.beta.data = w["alpha"], w["beta"]
+    m = m.float().eval().requires_grad_(False)
+    return m.to(dev) if dev is not None else m
+
+
 # ---------------------------------------------------------------- models ------------------------------------------------
 def _models(dino=True):
     if "lp" not in _M:
         import lpips
-        import os
-        import DISTS_pytorch
-        from DISTS_pytorch import DISTS
 
         if DEV != "cpu":                    # exact fp32 and deterministic kernels
             torch.backends.cudnn.deterministic = True
@@ -64,10 +76,7 @@ def _models(dino=True):
             torch.backends.cudnn.allow_tf32 = False
             torch.backends.cuda.matmul.allow_tf32 = False
         _M["lp"] = lpips.LPIPS(net="vgg", spatial=True, verbose=False).float().eval().requires_grad_(False).to(DEV)
-        m = DISTS(load_weights=False)
-        w = torch.load(os.path.join(os.path.dirname(DISTS_pytorch.__file__), "weights.pt"), map_location="cpu")
-        m.alpha.data, m.beta.data = w["alpha"], w["beta"]
-        m = m.float().eval().requires_grad_(False).to(DEV)
+        m = load_dists_model(DEV)
         ws = m.alpha.sum() + m.beta.sum()
         _M["dists"] = m
         _M["alpha"] = [a.cpu() for a in torch.split(m.alpha.data / ws, m.chns, dim=1)]
@@ -270,10 +279,6 @@ def _pair_terms(M, X, Y, dino):
     ly = _blur(_lab(Y["x01"]), SIG_LAB)
     out["color"] = (ly - lx).square().sum(1, keepdim=True).sqrt()
     return out
-
-
-def _bundle(x_u8):
-    return _t01(x_u8)
 
 
 class Context:

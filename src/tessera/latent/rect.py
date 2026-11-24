@@ -150,10 +150,7 @@ def kdtree_trace(shape_map_1):
         if can_v and not can_h:
             return ACT_SPLIT_V
         # Square (s, s): check whether a vertical cut or horizontal cut is respected (no tile crosses the midline)
-        mh = r0 + sh // 2
-        mv = c0 + sw // 2
-        # A tile crosses horizontal midline iff some cell at row mh-1 has tile extending across mh
-        # Since all tiles are power-of-2 aligned, a tile in [r0, r0+sh) crosses mh iff its height == sh
+        # Since all tiles are power-of-2 aligned, a tile in [r0, r0+sh) crosses the midline iff its height == sh
         # (already ruled out above if sw == sh; if sw < sh, height == sh means vertical half!).
         h_ok = not bool((sh_m[r0:r0 + sh, c0:c0 + sw] == sh).any())
         v_ok = not bool((sw_m[r0:r0 + sh, c0:c0 + sw] == sw).any())

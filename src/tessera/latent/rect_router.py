@@ -181,7 +181,7 @@ def verify_rect(shape_map, check_fn, max_rounds=8, split_choice_fn=None):
         if not splittable:
             break
         if bad is not None:
-            bad_b = bad.to("cpu").bool()
+            bad_b = torch.as_tensor(bad, device="cpu", dtype=torch.bool)
             to_split = [t for t in splittable if bool(bad_b[t[0]:t[0] + t[2], t[1]:t[1] + t[3]].any())]
         else:
             to_split = splittable
