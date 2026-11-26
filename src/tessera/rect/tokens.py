@@ -47,6 +47,14 @@ Binary Layout (`TSR2`, Version 1, little-endian)
     - tree_bytes  : `tree_n_bytes` bytes (MSB-first k-d tree bitstream; unused pad bits MUST be 0)
     - token_bytes : `n_tokens * token_dim * 4` bytes (contiguous `<f4` `[N, 128]`, all values finite)
 
+Binary Layout (`TSR2`, Version 2, little-endian)
+------------------------------------------------
+  68-byte header with the original image dimensions, block grid dimensions, padding mode and shared
+  checkpoint/TileUp settings. Its optional JSON object is file metadata. If flag 1 is set, the JSON
+  wraps file metadata under "grid" and per-block metadata under "blocks".
+  Row-major blocks share v1 tree and token encoding. After the JSON come all 6-byte block
+  descriptors (token count, tree bit count, tree byte count), then all trees, then all tokens.
+
 k-d Tree Bitstream (`encode_kdtree_bits` / `decode_kdtree_bits`)
 ----------------------------------------------------------------
   Breadth-first traversal starting from the 4 roots `[(0,0,32,32), (0,32,32,32), (32,0,32,32), (32,32,32,32)]`:
@@ -73,6 +81,7 @@ from tessera.rect.search import spike_clamp_resid
 
 MAGIC = b"TSR2"
 FORMAT_VERSION = 1
+FORMAT_VERSION_GRID = 2
 GRID_SIDE = RL.SIDE              # 64 FLUX.2 latent cells per side (512 px)
 TOKEN_DIM = RL.TOK               # 128 floats per leaf token
 DTYPE_FLOAT32 = 0
@@ -85,6 +94,16 @@ DEFAULT_SPIKE_MIN_AREA = 64
 
 _HEADER = struct.Struct("<4sHHHHBBHHHHIfI32s")
 HEADER_SIZE = _HEADER.size       # 66 bytes
+
+# v2 uses the v1 token dtype, dimensions, tree encoding and raster leaf order.
+# Header: magic, version, flags, original H/W, grid H/W, padding, order,
+# min spike area, seed, spike k, JSON byte count, and checkpoint digest.
+# Layout: header, JSON, all block descriptors, all trees, all float32 tokens.
+_GRID_HEADER = struct.Struct("<4sHHIIHHBBHIfI32s")
+_GRID_BLOCK = struct.Struct("<HHH")  # token count, tree bits, tree bytes
+_GRID_BLOCK_META = 1
+_PAD_MODES = ("none", "reflect")
+_BLOCK_PIXELS = GRID_SIDE * 8
 
 _ROOTS = ((0, 0, 32, 32), (0, 32, 32, 32), (32, 0, 32, 32), (32, 32, 32, 32))
 _SHA_CACHE: dict[tuple[str, int, int], str] = {}
@@ -196,6 +215,72 @@ class RectTokenFile:
     @property
     def n_tokens(self) -> int:
         return len(self.leaves)
+
+
+def _validate_grid_dimensions(orig_height: int, orig_width: int, grid_h: int, grid_w: int, pad_mode: str) -> None:
+    if not all(isinstance(size, int) and 1 <= size <= 65535 for size in (grid_h, grid_w)):
+        raise TokenFormatError("Grid height and width must be in [1, 65535]")
+    if not all(isinstance(size, int) and size > 0 for size in (orig_height, orig_width)):
+        raise TokenFormatError("Original grid image dimensions must be positive integers")
+    if pad_mode not in _PAD_MODES:
+        raise TokenFormatError(f"Unsupported grid padding mode {pad_mode!r}")
+    for size, blocks in ((orig_height, grid_h), (orig_width, grid_w)):
+        if (size + _BLOCK_PIXELS - 1) // _BLOCK_PIXELS != blocks:
+            raise TokenFormatError("Original image dimensions do not match the 512-pixel block grid")
+        if pad_mode == "none" and size != blocks * _BLOCK_PIXELS:
+            raise TokenFormatError("Unpadded grid requires original dimensions divisible by 512")
+
+
+@dataclasses.dataclass
+class RectGridTokenFile:
+    """TSR2 v2 image grid with v1 block layouts and shared codec settings.
+
+    Blocks appear in row-major order. Each block uses the grid's checkpoint,
+    seed, and TileUp spike settings. File and optional block metadata are JSON.
+    """
+
+    orig_height: int
+    orig_width: int
+    grid_h: int
+    grid_w: int
+    pad_mode: str
+    blocks: list[RectTokenFile]
+    ckpt_sha256: str
+    seed: int = DEFAULT_SEED
+    tu_spike_k: float = DEFAULT_SPIKE_K
+    tu_spike_min_area: int = DEFAULT_SPIKE_MIN_AREA
+    meta: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _validate_grid_dimensions(self.orig_height, self.orig_width, self.grid_h, self.grid_w, self.pad_mode)
+        self.ckpt_sha256 = _normalize_sha256_bytes(self.ckpt_sha256).hex()
+        if not isinstance(self.seed, int) or not 0 <= self.seed < 2**32:
+            raise TokenFormatError("Grid seed must be in [0, 2^32 - 1]")
+        if not math.isfinite(self.tu_spike_k) or not 0 <= self.tu_spike_k <= np.finfo(np.float32).max:
+            raise TokenFormatError("Grid tu_spike_k must be a finite non-negative float32")
+        if not isinstance(self.tu_spike_min_area, int) or not 0 <= self.tu_spike_min_area <= 65535:
+            raise TokenFormatError("Grid tu_spike_min_area must be in [0, 65535]")
+        if not isinstance(self.meta, dict):
+            raise TokenFormatError("Grid meta must be a dict")
+        if len(self.blocks) != self.n_blocks:
+            raise TokenFormatError(f"Grid expects {self.n_blocks} blocks, got {len(self.blocks)}")
+        for block in self.blocks:
+            if not isinstance(block, RectTokenFile) or (
+                block.ckpt_sha256, block.seed, block.tu_spike_k, block.tu_spike_min_area
+            ) != (self.ckpt_sha256, self.seed, self.tu_spike_k, self.tu_spike_min_area):
+                raise TokenFormatError("Each grid block must share the grid's checkpoint, seed, and spike settings")
+
+    @property
+    def n_tokens(self) -> int:
+        return sum(block.n_tokens for block in self.blocks)
+
+    @property
+    def n_blocks(self) -> int:
+        return self.grid_h * self.grid_w
+
+    @property
+    def block_tokens(self) -> list[int]:
+        return [block.n_tokens for block in self.blocks]
 
 
 # ---------------------------------------------------------------- k-d tree bitstream ----------------------------------
@@ -449,7 +534,138 @@ def load_tokens(path: str | pathlib.Path) -> RectTokenFile:
     return loads_tokens(p.read_bytes())
 
 
-def verify_checkpoint_sha256(tf: RectTokenFile, ckpt_path: str | pathlib.Path) -> str:
+def dumps_grid_tokens(tf: RectGridTokenFile) -> bytes:
+    """Serialize a grid to compact TSR2 v2 bytes."""
+    flags = 0
+    meta = tf.meta
+    if any(block.meta for block in tf.blocks):
+        flags = _GRID_BLOCK_META
+        meta = {"grid": tf.meta, "blocks": [block.meta for block in tf.blocks]}
+    try:
+        meta_bytes = json.dumps(meta, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8") if meta else b""
+    except (ValueError, TypeError) as exc:
+        raise TokenFormatError(f"Invalid grid metadata: {exc}") from exc
+    if len(meta_bytes) > MAX_META_BYTES:
+        raise TokenFormatError(f"Grid metadata exceeds {MAX_META_BYTES} bytes")
+    header = _GRID_HEADER.pack(
+        MAGIC, FORMAT_VERSION_GRID, flags, tf.orig_height, tf.orig_width, tf.grid_h, tf.grid_w,
+        _PAD_MODES.index(tf.pad_mode), ORDER_RASTER_TOP_LEFT, tf.tu_spike_min_area, tf.seed, tf.tu_spike_k,
+        len(meta_bytes), _normalize_sha256_bytes(tf.ckpt_sha256),
+    )
+    descriptors, trees, payloads = [], [], []
+    for block in tf.blocks:
+        tree, n_bits = encode_kdtree_bits(block.shape_map)
+        tokens = np.ascontiguousarray(block.tokens.detach().cpu().numpy(), dtype="<f4")
+        if tokens.shape != (block.n_tokens, TOKEN_DIM) or not np.isfinite(tokens).all():
+            raise TokenFormatError("Invalid grid block token payload")
+        descriptors.append(_GRID_BLOCK.pack(block.n_tokens, n_bits, len(tree)))
+        trees.append(tree)
+        payloads.append(tokens.tobytes())
+    return b"".join((header, meta_bytes, *descriptors, *trees, *payloads))
+
+
+def _finite_json_number(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"Non-finite JSON number {value}")
+    return number
+
+
+def loads_grid_tokens(data: bytes | bytearray | memoryview) -> RectGridTokenFile:
+    """Parse and strictly validate a TSR2 v2 image grid."""
+    buf = memoryview(data)
+    if not buf.c_contiguous:
+        buf = memoryview(bytes(buf))
+    buf = buf.cast("B")
+    if len(buf) < _GRID_HEADER.size:
+        raise TokenFormatError("Truncated TSR2 grid header")
+    (magic, version, flags, orig_h, orig_w, grid_h, grid_w, pad_code, order, spike_area,
+     seed, spike_k, meta_size, ckpt_bytes) = _GRID_HEADER.unpack_from(buf)
+    if magic != MAGIC or version != FORMAT_VERSION_GRID:
+        raise TokenFormatError(f"Invalid grid magic or version: {magic!r}, {version}")
+    if flags & ~_GRID_BLOCK_META or pad_code >= len(_PAD_MODES) or order != ORDER_RASTER_TOP_LEFT:
+        raise TokenFormatError("Unsupported grid flags, padding mode, or leaf order")
+    if meta_size > MAX_META_BYTES or not math.isfinite(spike_k) or spike_k < 0:
+        raise TokenFormatError("Invalid grid metadata length or spike settings")
+    pad_mode = _PAD_MODES[pad_code]
+    _validate_grid_dimensions(orig_h, orig_w, grid_h, grid_w, pad_mode)
+
+    desc_start = _GRID_HEADER.size + meta_size
+    n_blocks = grid_h * grid_w
+    tree_offset = desc_start + n_blocks * _GRID_BLOCK.size
+    if len(buf) < tree_offset + n_blocks * (1 + 4 * TOKEN_DIM * 4):
+        raise TokenFormatError("Truncated TSR2 grid descriptors or payload")
+    descriptors = list(_GRID_BLOCK.iter_unpack(buf[desc_start:tree_offset]))
+    for n_tokens, tree_bits, tree_bytes in descriptors:
+        if not 4 <= n_tokens <= (GRID_SIDE // 2) ** 2 or not 8 <= tree_bits <= 4096:
+            raise TokenFormatError("Invalid grid block token or tree bit count")
+        if tree_bytes != (tree_bits + 7) // 8:
+            raise TokenFormatError("Grid block tree byte count disagrees with tree bit count")
+    token_offset = tree_offset + sum(n_bytes for _, _, n_bytes in descriptors)
+    expected_size = token_offset + sum(n_tokens for n_tokens, _, _ in descriptors) * TOKEN_DIM * 4
+    if len(buf) != expected_size:
+        raise TokenFormatError(f"Grid file size mismatch: got {len(buf)} bytes, expected {expected_size}")
+
+    meta = {}
+    if meta_size:
+        try:
+            meta = json.loads(bytes(buf[_GRID_HEADER.size:desc_start]).decode("utf-8"),
+                              parse_constant=_finite_json_number, parse_float=_finite_json_number)
+        except (ValueError, RecursionError) as exc:
+            raise TokenFormatError(f"Malformed grid metadata JSON: {exc}") from exc
+        if not isinstance(meta, dict):
+            raise TokenFormatError("Grid metadata JSON must be an object")
+    block_meta = None
+    if flags & _GRID_BLOCK_META:
+        block_meta = meta.get("blocks")
+        if (not isinstance(meta.get("grid"), dict) or not isinstance(block_meta, list)
+                or len(block_meta) != n_blocks or not all(isinstance(item, dict) for item in block_meta)):
+            raise TokenFormatError("Invalid grid block metadata")
+        meta = meta["grid"]
+
+    shared = dict(ckpt_sha256=ckpt_bytes.hex(), seed=seed, tu_spike_k=spike_k, tu_spike_min_area=spike_area)
+    blocks = []
+    for i, (n_tokens, tree_bits, tree_bytes) in enumerate(descriptors):
+        shape_map = decode_kdtree_bits(buf[tree_offset:tree_offset + tree_bytes], tree_bits)
+        tree_offset += tree_bytes
+        leaves = tuple(RL.leaves_rect(shape_map))
+        if len(leaves) != n_tokens:
+            raise TokenFormatError(f"Grid block {i} token count disagrees with decoded layout")
+        values = np.frombuffer(buf, dtype="<f4", count=n_tokens * TOKEN_DIM, offset=token_offset)
+        token_offset += values.nbytes
+        tokens = torch.from_numpy(values.astype(np.float32).reshape(n_tokens, TOKEN_DIM))
+        blocks.append(RectTokenFile(shape_map, leaves, tokens, **shared,
+                                    meta={} if block_meta is None else block_meta[i]))
+    return RectGridTokenFile(orig_h, orig_w, grid_h, grid_w, pad_mode, blocks, **shared, meta=meta)
+
+
+def save_grid_tokens(path: str | pathlib.Path, tf: RectGridTokenFile) -> pathlib.Path:
+    """Write a TSR2 v2 image grid to disk."""
+    p = pathlib.Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(dumps_grid_tokens(tf))
+    return p
+
+
+def load_grid_tokens(path: str | pathlib.Path) -> RectGridTokenFile:
+    """Load a TSR2 v2 image grid from disk."""
+    return loads_grid_tokens(pathlib.Path(path).read_bytes())
+
+
+def load_any_tokens(path: str | pathlib.Path) -> RectTokenFile | RectGridTokenFile:
+    """Load a TSR2 file by dispatching on the version in its header."""
+    data = pathlib.Path(path).read_bytes()
+    if len(data) < 6 or data[:4] != MAGIC:
+        raise TokenFormatError("Missing or invalid TSR2 magic/version")
+    version, = struct.unpack_from("<H", data, 4)
+    if version == FORMAT_VERSION:
+        return loads_tokens(data)
+    if version == FORMAT_VERSION_GRID:
+        return loads_grid_tokens(data)
+    raise TokenFormatError(f"Unsupported TSR2 format version {version}")
+
+
+def verify_checkpoint_sha256(tf: RectTokenFile | RectGridTokenFile, ckpt_path: str | pathlib.Path) -> str:
     """Verify that `ckpt_path` matches `tf.ckpt_sha256`; returns the digest or raises `CheckpointMismatchError`."""
     actual = file_sha256(ckpt_path)
     if actual != tf.ckpt_sha256:
@@ -625,3 +841,25 @@ def decode_tokens_to_latent(
     else:
         z_n = canvas
     return (z_n * sv + mv).float()
+
+
+@torch.no_grad()
+def decode_grid_tokens_to_latent(
+    grid_tf: RectGridTokenFile,
+    model,
+    basis_dev: dict[tuple[int, int], dict[str, Any]],
+    mean: torch.Tensor,
+    std: torch.Tensor,
+) -> torch.Tensor:
+    """Reconstruct and assemble the raw FLUX.2 latent in row-major block order."""
+    dev = next(iter(basis_dev.values()))["U"].device
+    z = torch.empty((1, RL.CH, grid_tf.grid_h * GRID_SIDE, grid_tf.grid_w * GRID_SIDE),
+                    device=dev, dtype=torch.float32)
+    for i, block in enumerate(grid_tf.blocks):
+        row, col = divmod(i, grid_tf.grid_w)
+        y, x = row * GRID_SIDE, col * GRID_SIDE
+        z[..., y:y + GRID_SIDE, x:x + GRID_SIDE] = decode_tokens_to_latent(
+            block.shape_map, block.tokens, model, basis_dev, mean, std,
+            seed=grid_tf.seed, tu_spike_k=grid_tf.tu_spike_k, tu_spike_min_area=grid_tf.tu_spike_min_area,
+        )
+    return z

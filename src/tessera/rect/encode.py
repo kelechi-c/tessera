@@ -13,6 +13,7 @@ import json
 import math
 import pathlib
 import time
+from collections.abc import Callable
 
 import click
 import numpy as np
@@ -44,15 +45,18 @@ from tessera.rect.search import (
     rd_layout,
     split_kdtree_topdown_td,
 )
+from tessera.rect.tiled_vae import ExactTiledFluxVAE, GNStats, decode_window_with_global_gn
 from tessera.rect.tokens import (
     DEFAULT_SEED,
-    CheckpointMismatchError,
+    GRID_SIDE,
+    RectGridTokenFile,
     RectTokenFile,
-    TokenFormatError,
+    decode_grid_tokens_to_latent,
     decode_tokens_to_latent,
     extract_leaf_tokens,
     file_sha256,
-    load_tokens,
+    load_any_tokens,
+    save_grid_tokens,
     save_tokens,
     verify_checkpoint_sha256,
 )
@@ -203,8 +207,9 @@ def _encode_single_latent(
     prune_max_calls=48,
     prune_max_rounds=8,
     seed=DEFAULT_SEED,
+    search_seed=DEFAULT_SEED,
 ):
-    """Run Judge-verified rectangular tokenization on one pre-encoded latent `z1_cpu` [1,32,64,64]."""
+    """Run Judge-verified rectangular tokenization on one raw [1, 32, 64, 64] latent."""
     dev_t = torch.device(dev)
     use_cuda = dev_t.type == "cuda"
     _configure_cuda_determinism(dev_t)
@@ -223,7 +228,7 @@ def _encode_single_latent(
     rect_pyr_n = RTD.encode_rect_pyramid_td(zn, basis_dev, tiledown=td)
     extra = {}
     if mode == "topdown":
-        res = split_kdtree_topdown_td(tu, td, z1, basis_dev, mean, std, dec, judge, max_rounds=48)
+        res = split_kdtree_topdown_td(tu, td, z1, basis_dev, mean, std, dec, judge, max_rounds=48, seed=search_seed)
         sm, y_m11, passed, calls = res["shape_map"], res["y"], bool(res["passed"]), int(res["calls"])
         toks = int(res["tokens"])
     else:
@@ -273,6 +278,7 @@ def _encode_single_latent(
         pr = prune_kdtree_siblings_td(
             tu, td, z1, basis_dev, mean, std, dec, judge, sm,
             bisect_dirty=(not prune_fast), max_calls=prune_max_calls, max_rounds=prune_max_rounds,
+            seed=search_seed,
         )
         sm, y_m11, passed = pr["shape_map"], pr["y"], bool(pr["passed"])
         calls, toks, n_merges = int(calls) + int(pr["prune_calls"]), int(pr["tokens"]), int(pr["merges"])
@@ -298,6 +304,68 @@ def _encode_single_latent(
         ms=dt_ms,
         extra=extra,
     )
+
+
+def _load_native_planes(
+    x_u8: np.ndarray, dev: str | torch.device, repo: str,
+) -> tuple[np.ndarray, ExactTiledFluxVAE, torch.Tensor, torch.Tensor, GNStats]:
+    """Pad once and produce the global latent, reference, and frozen decoder stats."""
+    height, width = x_u8.shape[:2]
+    pad_h, pad_w = -height % 512, -width % 512
+    if pad_h or pad_w:
+        # NumPy supports repeated reflection when a dimension is shorter than
+        # the pad, and repeats the sole pixel along singleton dimensions.
+        x_u8 = np.pad(x_u8, ((0, pad_h), (0, pad_w), (0, 0)), mode="reflect")
+    dev_t = torch.device(dev)
+    _configure_cuda_determinism(dev_t)
+    vae = load_flux_vae(repo_id=repo).eval()
+    encoder_dtype = torch.float16 if dev_t.type == "cuda" else torch.float32
+    vae.encoder.to(device=dev_t, dtype=encoder_dtype)
+    if vae.quant_conv is not None:
+        vae.quant_conv.to(device=dev_t, dtype=encoder_dtype)
+    tiled = ExactTiledFluxVAE(vae, device=dev_t)
+    z_global = tiled.encode(x_u8)
+    decoder_only_flux(dev_t, vae=vae, repo_id=repo)
+    g_global, gn_stats = tiled.decode(z_global, return_gn_stats=True)
+    return x_u8, tiled, z_global, g_global.cpu(), gn_stats
+
+
+def _block_judge_decoder(
+    tiled: ExactTiledFluxVAE, z_global: torch.Tensor, g_global: torch.Tensor, gn_stats: GNStats,
+    y: int, x: int, halo: int,
+) -> tuple[torch.Tensor, Callable[[torch.Tensor], torch.Tensor]]:
+    """Return the core latent and a paired, globally calibrated Judge decoder."""
+    top, left = max(0, y - halo), max(0, x - halo)
+    window = z_global[..., top:y + GRID_SIDE + halo, left:x + GRID_SIDE + halo]
+    row, col = y - top, x - left
+    core = (slice(row, row + GRID_SIDE), slice(col, col + GRID_SIDE))
+    core_pixels = (slice(row * 8, (row + GRID_SIDE) * 8), slice(col * 8, (col + GRID_SIDE) * 8))
+    reference = g_global[..., y * 8:(y + GRID_SIDE) * 8, x * 8:(x + GRID_SIDE) * 8]
+    reference = reference.to(tiled.device, dtype=torch.float32)
+    original = window[..., *core]
+    baseline = None
+
+    def decode_core(z: torch.Tensor) -> torch.Tensor:
+        return decode_window_with_global_gn(tiled.vae, z, gn_stats, device=tiled.device)[..., *core_pixels].float()
+
+    def decode(candidate: torch.Tensor) -> torch.Tensor:
+        nonlocal baseline
+        if torch.equal(candidate, original):
+            return reference
+        if baseline is None:
+            baseline = decode_core(window)
+        patched = window.clone()
+        patched[..., *core] = candidate
+        # The window shares global GroupNorm but has local attention. Anchor
+        # the paired window difference to the actual whole-image RGB reference.
+        return reference + (decode_core(patched) - baseline)
+
+    return original, decode
+
+
+def _rgb_u8(y_m11: torch.Tensor) -> np.ndarray:
+    y_t = (y_m11.float().clamp(-1, 1) + 1.0) * 0.5
+    return (y_t[0].permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
 
 
 def encode_image(
@@ -329,8 +397,12 @@ def encode_image(
     prune_max_rounds=8,
     seed=DEFAULT_SEED,
     return_reference_u8=False,
+    native_res: bool = False,
+    halo_cells: int = 16,
 ):
-    """Encode a single image file into a standalone versioned binary `.tsr` token file (no embedded pixels/latents)."""
+    """Encode an image to TSR2 v1, or preserve its dimensions with `native_res`."""
+    if not isinstance(halo_cells, int) or halo_cells < 0:
+        raise ValueError("halo_cells must be a non-negative integer")
     src = pathlib.Path(photo)
     if not src.is_file():
         raise FileNotFoundError(f"Input photo not found: {src}")
@@ -341,12 +413,19 @@ def encode_image(
     router_path = resolve_router_path(router, repo_id=repo) if mode == "router" else None
     ckpt_sha = file_sha256(ckpt_path)
 
-    entries, vae = _load_images(src, 1, dev, paths=paths, return_vae=True, repo_id=repo)
+    native_planes = None
+    if native_res:
+        with Image.open(src) as raw:
+            rgb = ImageOps.exif_transpose(raw).convert("RGB")
+        if rgb.size != (512, 512):
+            height, width = rgb.height, rgb.width
+            native_planes = _load_native_planes(np.array(rgb), dev, repo)
+    if native_planes is None:
+        entries, vae = _load_images(src, 1, dev, paths=paths, return_vae=True, repo_id=repo)
     tu, td, basis_dev, mean, std, _ = load_tokenizer_ckpt(ckpt_path, dev)
     if tu_spike_k > 0:
         tu._spike_k, tu._spike_min_area = float(tu_spike_k), int(tu_spike_min_area)
     router_mod = _load_router(router_path, dev) if router_path is not None else None
-    dec = decoder_only_flux(dev, vae=vae, repo_id=repo)
 
     jx = {
         k: v
@@ -358,17 +437,13 @@ def encode_image(
         ).items()
         if v is not None
     }
-    _, z1_cpu, x_u8 = entries[0]
-    res = _encode_single_latent(
-        z1_cpu,
-        x_u8,
+    block_options = dict(
         dev=dev,
         tu=tu,
         td=td,
         basis_dev=basis_dev,
         mean=mean,
         std=std,
-        dec=dec,
         mode=mode,
         router_mod=router_mod,
         leaf_bias=leaf_bias,
@@ -387,28 +462,56 @@ def encode_image(
         seed=seed,
     )
 
-    leaves, leaf_tokens = extract_leaf_tokens(res["rect_pyr_n"], res["shape_map"])
     meta = dict(
         ckpt_name=ckpt_path.name,
         mode=mode,
-        passed=bool(res["passed"]),
-        calls=int(res["calls"]),
         verify=bool(verify),
     )
     if repo and ckpt is None:
         meta["repo"] = repo
-    tf = RectTokenFile(
-        shape_map=res["shape_map"][0],
-        leaves=leaves,
-        tokens=leaf_tokens,
+    token_options = dict(
         ckpt_sha256=ckpt_sha,
         seed=seed,
         tu_spike_k=float(tu_spike_k),
         tu_spike_min_area=int(tu_spike_min_area),
-        meta=meta,
     )
-    save_tokens(output, tf)
-    return (tf, res["y_u8"]) if return_reference_u8 else tf
+
+    def make_block(res, block_meta):
+        leaves, tokens = extract_leaf_tokens(res["rect_pyr_n"], res["shape_map"])
+        return RectTokenFile(res["shape_map"][0], leaves, tokens, **token_options, meta=block_meta)
+
+    if native_planes is None:
+        _, z1_cpu, x_u8 = entries[0]
+        dec = decoder_only_flux(dev, vae=vae, repo_id=repo)
+        res = _encode_single_latent(z1_cpu, x_u8, dec=dec, **block_options)
+        meta.update(passed=bool(res["passed"]), calls=int(res["calls"]))
+        tf = make_block(res, meta)
+        save_tokens(output, tf)
+        return (tf, res["y_u8"]) if return_reference_u8 else tf
+
+    x_u8, tiled, z_global, g_global, gn_stats = native_planes
+    grid_h, grid_w = x_u8.shape[0] // 512, x_u8.shape[1] // 512
+    # All v2 search modes use the seed written into the grid header.
+    block_options["search_seed"] = seed
+    blocks = []
+    passed, calls = True, 0
+    for r in range(grid_h):
+        for c in range(grid_w):
+            y, x = r * GRID_SIDE, c * GRID_SIDE
+            z, block_dec = _block_judge_decoder(tiled, z_global, g_global, gn_stats, y, x, halo_cells)
+            pixels = x_u8[y * 8:(y + GRID_SIDE) * 8, x * 8:(x + GRID_SIDE) * 8].copy()
+            res = _encode_single_latent(z, pixels, dec=block_dec, **block_options)
+            blocks.append(make_block(res, {}))
+            passed = passed and bool(res["passed"])
+            calls += int(res["calls"])
+    meta.update(passed=passed, calls=calls, halo_cells=halo_cells)
+    pad_mode = "none" if (height, width) == x_u8.shape[:2] else "reflect"
+    grid_tf = RectGridTokenFile(height, width, grid_h, grid_w, pad_mode, blocks, **token_options, meta=meta)
+    save_grid_tokens(output, grid_tf)
+    if return_reference_u8:
+        z_hat = decode_grid_tokens_to_latent(grid_tf, tu, basis_dev, mean, std)
+        return grid_tf, _rgb_u8(tiled.decode(z_hat)[..., :height, :width])
+    return grid_tf
 
 
 @torch.no_grad()
@@ -427,28 +530,24 @@ def decode_file(
     use_cuda = dev_t.type == "cuda"
     _configure_cuda_determinism(dev_t)
 
-    tf = load_tokens(token_file)
+    tf = load_any_tokens(token_file)
     ckpt_path = resolve_ckpt_path(ckpt, repo_id=repo)
     if not allow_ckpt_mismatch:
         verify_checkpoint_sha256(tf, ckpt_path)
 
     tu, _, basis_dev, mean, std, _ = load_tokenizer_ckpt(ckpt_path, dev, load_tiledown=False)
     dec = decoder_only_flux(dev, repo_id=repo)
-    z_hat = decode_tokens_to_latent(
-        tf.shape_map,
-        tf.tokens,
-        tu,
-        basis_dev,
-        mean,
-        std,
-        seed=tf.seed,
-        tu_spike_k=tf.tu_spike_k,
-        tu_spike_min_area=tf.tu_spike_min_area,
-    )
-    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_cuda):
-        y_m11 = dec(z_hat).float().clamp(-1, 1)
-    y_t = (y_m11 + 1.0) * 0.5
-    y_u8 = (y_t[0].permute(1, 2, 0).cpu().numpy() * 255.0).round().astype(np.uint8)
+    if isinstance(tf, RectGridTokenFile):
+        z_hat = decode_grid_tokens_to_latent(tf, tu, basis_dev, mean, std)
+        y_m11 = ExactTiledFluxVAE(dec.vae, device=dev).decode(z_hat)[..., :tf.orig_height, :tf.orig_width]
+    else:
+        z_hat = decode_tokens_to_latent(
+            tf.shape_map, tf.tokens, tu, basis_dev, mean, std,
+            seed=tf.seed, tu_spike_k=tf.tu_spike_k, tu_spike_min_area=tf.tu_spike_min_area,
+        )
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_cuda):
+            y_m11 = dec(z_hat)
+    y_u8 = _rgb_u8(y_m11)
 
     out_path = pathlib.Path(output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -497,6 +596,9 @@ def main():
               help="local router checkpoint (overrides --repo)")
 @click.option("--device", default="auto", show_default=True,
               help="device: auto, cpu, cuda, or cuda:<index>")
+@click.option("--native-res", "--tiled", is_flag=True, help="Preserve the source resolution with a seamless TSR2 grid")
+@click.option("--halo-cells", type=click.IntRange(min=0), default=16, show_default=True,
+              help="Native-resolution Judge halo in latent cells (8 pixels per cell)")
 @click.option("--mode", type=click.Choice(["router", "topdown", "rdtree"]),
               default=VERIFIED_ENCODE_DEFAULTS["mode"], show_default=True)
 @click.option("--leaf_bias", type=float, default=VERIFIED_ENCODE_DEFAULTS["leaf_bias"], show_default=True,
@@ -530,7 +632,7 @@ def encode_cmd(
     photo, output, repo, ckpt, router, device, mode, leaf_bias, verify, verify_rounds,
     rd_lambda, rd_beta, rd_area_pow, rd_tau, judge_scale, struct_scale, color_floor_de,
     color_max_floor_de, mae32_limit, tu_spike_k, tu_spike_min_area, prune_merges,
-    prune_fast, prune_max_calls, prune_max_rounds,
+    prune_fast, prune_max_calls, prune_max_rounds, native_res, halo_cells,
 ):
     """Encode PHOTO into a standalone versioned binary token file OUTPUT (.tsr)."""
     try:
@@ -561,10 +663,12 @@ def encode_cmd(
             prune_fast=prune_fast,
             prune_max_calls=prune_max_calls,
             prune_max_rounds=prune_max_rounds,
+            native_res=native_res,
+            halo_cells=halo_cells,
         )
     except click.ClickException:
         raise
-    except (ValueError, FileNotFoundError, RuntimeError, TokenFormatError) as exc:
+    except (ValueError, OSError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
 
     size_kb = pathlib.Path(output).stat().st_size / 1024.0
@@ -600,7 +704,7 @@ def decode_cmd(token_file, output, repo, ckpt, device, allow_ckpt_mismatch):
         )
     except click.ClickException:
         raise
-    except (ValueError, FileNotFoundError, RuntimeError, TokenFormatError, CheckpointMismatchError) as exc:
+    except (ValueError, OSError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
 
     dt = time.time() - t0

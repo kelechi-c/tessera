@@ -128,7 +128,7 @@ def predict_rect_canvas_td(model, z512, rect_pyr_n, shape_map, basis_dev, mean, 
 
 @torch.no_grad()
 def prune_kdtree_siblings_td(model, tiledown, z512_1, basis_dev, mean, std, dec, judge, shape_map, max_rounds=8,
-                             max_area=1024, ev_init=None, y_init=None, bisect_dirty=True, max_calls=0):
+                             max_area=1024, ev_init=None, y_init=None, bisect_dirty=True, max_calls=0, *, seed=0):
     """Judge-verified bottom-up pruning of a passing top-down layout (e.g. from `split_kdtree_topdown_td`).
 
     Each round collects sibling leaf pairs sharing an immediate k-d parent (`sibling_merge_candidates`), orders them by
@@ -155,7 +155,7 @@ def prune_kdtree_siblings_td(model, tiledown, z512_1, basis_dev, mean, std, dec,
 
     def _eval(sm_c):
         nonlocal calls
-        z = predict_rect_canvas_td(model, z512_f, rect_pyr_n, sm_c, basis_dev, mean, std, seed=0)
+        z = predict_rect_canvas_td(model, z512_f, rect_pyr_n, sm_c, basis_dev, mean, std, seed=seed)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_cuda):
             y = dec(z).float().clamp(-1, 1)
         calls += 1
@@ -274,7 +274,7 @@ def spike_clamp_resid(resid, shape_map, k, min_area=64):
 
 
 @torch.no_grad()
-def split_kdtree_topdown_td(model, tiledown, z512_1, basis_dev, mean, std, dec, judge, max_rounds=48):
+def split_kdtree_topdown_td(model, tiledown, z512_1, basis_dev, mean, std, dec, judge, max_rounds=48, *, seed=0):
     """Top-down greedy 2:1 k-d tree labeling with optional `RectTileDown` (CPU and CUDA safe): every round splits every
     splittable leaf overlapping a Judge `bad8` cell, until the Judge passes."""
     dev = z512_1.device
@@ -300,7 +300,7 @@ def split_kdtree_topdown_td(model, tiledown, z512_1, basis_dev, mean, std, dec, 
         for r0, c0, sh, sw in leaves:
             sm[0, 0, r0:r0 + sh, c0:c0 + sw] = sh
             sm[0, 1, r0:r0 + sh, c0:c0 + sw] = sw
-        z = predict_rect_canvas_td(model, z512_f, rect_pyr_n, sm, basis_dev, mean, std, seed=0)
+        z = predict_rect_canvas_td(model, z512_f, rect_pyr_n, sm, basis_dev, mean, std, seed=seed)
         y_cur = _decode(z)
         ev_cur = judge(y_cur)
         calls += 1
